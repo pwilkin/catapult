@@ -99,3 +99,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation cove
 - **Frontend:** React, TypeScript, Vite, Tailwind CSS
 - **Testing:** Vitest (frontend), `#[cfg(test)]` modules (backend)
 - **CI:** GitHub Actions — tests on every push/PR, cross-platform builds on main/tags
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
