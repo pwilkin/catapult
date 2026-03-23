@@ -80,6 +80,7 @@ export default function Runtime() {
     if (!selectedAsset) return;
     setDownloading(true);
     setError(null);
+    setProgress({ id: "runtime", bytes_downloaded: 0, total_bytes: 0, percent: 0, status: "downloading" });
     const unlisten = await listen<DownloadProgress>("download_progress", (e) => {
       setProgress(e.payload);
     });
@@ -94,6 +95,11 @@ export default function Runtime() {
       unlisten();
       setDownloading(false);
     }
+  };
+
+  const cancelDownload = () => {
+    setDownloading(false);
+    setProgress(null);
   };
 
   const browseCustom = async () => {
@@ -482,22 +488,29 @@ export default function Runtime() {
 
               {selectedAsset && (
                 <div className="mt-4">
-                  {progress && progress.status !== "done" ? (
+                  {downloading ? (
                     <div>
                       <div className="flex items-center justify-between mb-2">
                         <span className="text-sm text-gray-300">
-                          {progress.status === "extracting" ? "Extracting…" : "Downloading…"}
+                          {progress?.status === "extracting" ? "Extracting…" : "Downloading…"}
                         </span>
-                        <span className="text-xs font-mono text-gray-400">{progress.percent.toFixed(1)}%</span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-xs font-mono text-gray-400">{(progress?.percent ?? 0).toFixed(1)}%</span>
+                          {progress?.status !== "extracting" && (
+                            <button className="btn-ghost text-xs text-accent-red py-0.5" onClick={cancelDownload}>
+                              Cancel
+                            </button>
+                          )}
+                        </div>
                       </div>
                       <div className="progress-bar">
-                        <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+                        <div className="progress-fill" style={{ width: `${progress?.percent ?? 0}%` }} />
                       </div>
                     </div>
                   ) : (
-                    <button className="btn-primary w-full justify-center" onClick={startDownload} disabled={downloading}>
+                    <button className="btn-primary w-full justify-center" onClick={startDownload}>
                       <Download size={15} />
-                      {downloading ? "Preparing…" : `Download ${selectedAsset}`}
+                      Download {selectedAsset}
                     </button>
                   )}
                 </div>

@@ -174,23 +174,77 @@ const DEFAULT_CONFIG: ServerConfig = {
 
 // ── Main component ───────────────────────────────────────────────────────────
 
+// Session-storage helpers to retain config across page navigation
+const SESSION_CONFIG_KEY = "catapult_server_config";
+const SESSION_PRESET_KEY = "catapult_server_preset";
+const SESSION_TAB_KEY = "catapult_server_tab";
+
+function loadSessionConfig(): ServerConfig | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_CONFIG_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
 export default function Server() {
   const navigate = useNavigate();
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [config, setConfig] = useState<ServerConfig>(DEFAULT_CONFIG);
+  const [config, setConfigRaw] = useState<ServerConfig>(() => loadSessionConfig() ?? DEFAULT_CONFIG);
   const [status, setStatus] = useState<ServerStatus>({ type: "stopped" });
   const [logs, setLogs] = useState<string[]>([]);
-  const [activeTab, setActiveTab] = useState<Tab>("Context");
+  const [activeTab, setActiveTabRaw] = useState<Tab>(() => {
+    const saved = sessionStorage.getItem(SESSION_TAB_KEY);
+    return saved && TABS.includes(saved as Tab) ? (saved as Tab) : "Context";
+  });
   const [showLogs, setShowLogs] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openingChat, setOpeningChat] = useState(false);
   const [showModelList, setShowModelList] = useState(false);
   const logsRef = useRef<HTMLDivElement>(null);
+  const pendingLogs = useRef<string[]>([]);
+  const logRaf = useRef<number | null>(null);
   const [presets, setPresets] = useState<string[]>([]);
-  const [activePreset, setActivePreset] = useState<string | null>(null);
+  const [activePreset, setActivePresetRaw] = useState<string | null>(() => {
+    return sessionStorage.getItem(SESSION_PRESET_KEY) || null;
+  });
   const [showPresetMenu, setShowPresetMenu] = useState(false);
   const [saveName, setSaveName] = useState("");
   const [favorites, setFavorites] = useState<string[]>([]);
+
+  // Wrappers that persist to sessionStorage
+  const setConfig: typeof setConfigRaw = useCallback((v) => {
+    setConfigRaw((prev) => {
+      const next = typeof v === "function" ? v(prev) : v;
+      sessionStorage.setItem(SESSION_CONFIG_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  const setActivePreset = useCallback((v: string | null) => {
+    setActivePresetRaw(v);
+    if (v) sessionStorage.setItem(SESSION_PRESET_KEY, v);
+    else sessionStorage.removeItem(SESSION_PRESET_KEY);
+  }, []);
+
+  const setActiveTab = useCallback((v: Tab) => {
+    setActiveTabRaw(v);
+    sessionStorage.setItem(SESSION_TAB_KEY, v);
+  }, []);
+
+  const flushLogs = useCallback(() => {
+    logRaf.current = null;
+    const batch = pendingLogs.current;
+    if (batch.length === 0) return;
+    pendingLogs.current = [];
+    setLogs((prev) => [...prev, ...batch].slice(-500));
+  }, []);
+
+  const addLog = useCallback((line: string) => {
+    pendingLogs.current.push(line);
+    if (logRaf.current === null) {
+      logRaf.current = requestAnimationFrame(flushLogs);
+    }
+  }, [flushLogs]);
 
   useEffect(() => {
     if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight;
@@ -340,7 +394,8 @@ export default function Server() {
   useEffect(() => {
     loadData();
     refreshPresets();
-    loadDefaults();
+    // Only load defaults if no session-restored config
+    if (!loadSessionConfig()) loadDefaults();
     // Load any existing logs (e.g. server started from Dashboard)
     invoke<string[]>("get_server_logs").then((existing) => {
       if (existing.length > 0) {
@@ -349,12 +404,16 @@ export default function Server() {
       }
     }).catch(() => {});
     const unlistenLog = listen<string>("server_log", (e) => {
-      setLogs((prev) => [...prev.slice(-499), e.payload]);
+      addLog(e.payload);
     });
     const interval = setInterval(async () => {
       try { setStatus(await invoke<ServerStatus>("get_server_status")); } catch {}
     }, 2000);
-    return () => { unlistenLog.then((f) => f()); clearInterval(interval); };
+    return () => {
+      unlistenLog.then((f) => f());
+      clearInterval(interval);
+      if (logRaf.current !== null) cancelAnimationFrame(logRaf.current);
+    };
   }, []);
 
   const applyModelConfig = async (modelPath: string) => {

@@ -275,6 +275,42 @@ export default function Models() {
           </div>
         )}
 
+        {/* ── Active downloads (visible across all tabs) ── */}
+        {Object.keys(downloads).length > 0 && (
+          <div className="mb-4 card">
+            <h3 className="text-xs font-medium text-gray-400 mb-2">Downloading</h3>
+            <div className="space-y-2">
+              {Object.entries(downloads).map(([filename, dl]) => (
+                <div key={filename}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs text-gray-300 truncate mr-3">{filename}</span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {dl.status === "paused" ? (
+                        <>
+                          <span className="text-[10px] text-accent-yellow">Paused</span>
+                          <button className="btn-danger text-[10px] py-0.5 px-1.5" onClick={() => abortDownload(filename)}>
+                            Abort
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-[10px] font-mono text-gray-500">{dl.percent.toFixed(1)}%</span>
+                          <span className="text-[10px] text-gray-600">{formatSize(dl.bytes_downloaded)} / {formatSize(dl.total_bytes)}</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {dl.status !== "paused" && (
+                    <div className="progress-bar h-1">
+                      <div className="progress-fill" style={{ width: `${dl.percent}%` }} />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* ── Installed tab ── */}
         {tab === "installed" && (() => {
           const filtered = installed
