@@ -24,7 +24,7 @@ import type {
   AppConfig,
 } from "../types";
 
-import { mbToGb, shortCpuName, shortGpuName } from "../utils/format";
+import { mbToGb, shortCpuName, shortGpuName, quantColor } from "../utils/format";
 
 function StatusDot({ ok }: { ok: boolean }) {
   return (
@@ -128,9 +128,9 @@ export default function Dashboard() {
     } catch {}
   };
 
-  const deleteModel = async (modelId: string) => {
+  const deleteModel = async (path: string) => {
     try {
-      await invoke("delete_model", { modelId });
+      await invoke("delete_model", { path });
       setConfirmDelete(null);
       await loadData();
     } catch (e) {
@@ -163,23 +163,12 @@ export default function Dashboard() {
   const favorites = appConfig?.favorite_models ?? [];
   const isRunning = serverStatus.type === "running" || serverStatus.type === "starting";
 
-  // Sort: favorites first, then alphabetical
-  const sortedModels = [...models].sort((a, b) => {
-    const aFav = favorites.includes(a.id) ? 0 : 1;
-    const bFav = favorites.includes(b.id) ? 0 : 1;
-    if (aFav !== bFav) return aFav - bFav;
-    return a.name.localeCompare(b.name);
-  });
+  const favoriteModels = models
+    .filter((m) => favorites.includes(m.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   return (
     <div className="flex-1 overflow-y-auto p-6 space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-100">Dashboard</h1>
-        <p className="text-gray-500 text-sm mt-1">
-          System overview and quick actions
-        </p>
-      </div>
-
       {error && (
         <div className="card border-accent-red/30 bg-accent-red/5">
           <p className="text-sm text-accent-red">{error}</p>
@@ -482,22 +471,14 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Models overview */}
-      {models.length > 0 && (
+      {/* Favorite models */}
+      {favoriteModels.length > 0 && (
         <div>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-semibold text-gray-300">
-              Installed Models
-            </h2>
-            <button
-              onClick={() => navigate("/models")}
-              className="text-xs text-primary-light hover:underline"
-            >
-              Manage
-            </button>
-          </div>
+          <h2 className="text-sm font-semibold text-gray-300 mb-3">
+            Favorite Models
+          </h2>
           <div className="space-y-1">
-            {sortedModels.map((m) => {
+            {favoriteModels.map((m) => {
               const isFav = favorites.includes(m.id);
               const isSelected = appConfig?.selected_model === m.path;
               const isDeleting = confirmDelete === m.id;
@@ -534,7 +515,7 @@ export default function Dashboard() {
                   </span>
 
                   {m.quant && (
-                    <span className="badge-purple text-[10px]">{m.quant}</span>
+                    <span className={`${quantColor(m.quant)} text-[10px]`}>{m.quant}</span>
                   )}
                   <span className="text-xs text-gray-500">
                     {(m.size_bytes / (1024 ** 3)).toFixed(1)} GB
@@ -561,7 +542,7 @@ export default function Dashboard() {
                     <div className="flex items-center gap-1">
                       <button
                         className="text-xs text-accent-red hover:underline"
-                        onClick={() => deleteModel(m.id)}
+                        onClick={() => deleteModel(m.path)}
                       >
                         Confirm
                       </button>

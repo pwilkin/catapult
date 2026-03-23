@@ -108,6 +108,18 @@
     @apply badge bg-accent-red/15 text-accent-red;
   }
 
+  .badge-red-dark {
+    @apply badge bg-accent-red-dark/15 text-accent-red-dark;
+  }
+
+  .badge-orange {
+    @apply badge bg-accent-orange/15 text-accent-orange;
+  }
+
+  .badge-cyan {
+    @apply badge bg-accent-cyan/15 text-accent-cyan;
+  }
+
   .badge-blue {
     @apply badge bg-accent-blue/15 text-accent-blue;
   }

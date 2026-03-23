@@ -22,6 +22,9 @@ pub struct ModelInfo {
     pub context_length: Option<u64>,
     pub is_vision: bool,
     pub mmproj_path: Option<PathBuf>,
+    /// Paths to all parts for split GGUF models (empty for single-file models).
+    #[serde(default)]
+    pub split_files: Vec<PathBuf>,
 }
 
 /// Metadata extracted from a GGUF file header.
@@ -233,8 +236,58 @@ pub fn list_installed_models(config: &AppConfig) -> Result<Vec<ModelInfo>> {
         save_cache(&cache);
     }
 
+    // Consolidate split GGUF files into single entries
+    models = consolidate_split_models(models);
+
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+/// Group split GGUF parts (e.g. model-00001-of-00003.gguf) into single ModelInfo entries.
+/// Only consolidates when ALL expected parts are present.
+fn consolidate_split_models(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    use std::collections::BTreeMap;
+
+    let mut singles = Vec::new();
+    let mut split_groups: BTreeMap<String, Vec<ModelInfo>> = BTreeMap::new();
+
+    for model in models {
+        if let Some((base, _part, total)) = huggingface::parse_split_filename(&model.filename) {
+            let dir = model.path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let key = format!("{}|{}-{:05}", dir, base, total);
+            split_groups.entry(key).or_default().push(model);
+        } else {
+            singles.push(model);
+        }
+    }
+
+    for (_key, mut parts) in split_groups {
+        let expected_total = huggingface::parse_split_filename(&parts[0].filename)
+            .map(|(_, _, t)| t)
+            .unwrap_or(0) as usize;
+
+        if parts.len() != expected_total {
+            // Not all parts present — show individually
+            singles.extend(parts);
+            continue;
+        }
+
+        parts.sort_by_key(|m| {
+            huggingface::parse_split_filename(&m.filename).map(|(_, n, _)| n).unwrap_or(0)
+        });
+
+        let total_size: u64 = parts.iter().map(|p| p.size_bytes).sum();
+        let split_files: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
+        let first = parts.into_iter().next().unwrap();
+
+        singles.push(ModelInfo {
+            size_bytes: total_size,
+            split_files,
+            ..first
+        });
+    }
+
+    singles
 }
 
 fn scan_gguf_recursive(
@@ -326,6 +379,7 @@ fn scan_gguf_recursive(
                 context_length: cached_meta.context_length,
                 is_vision: cached_meta.is_vision,
                 mmproj_path,
+                split_files: vec![],
             });
         } else if path.is_dir() {
             scan_gguf_recursive(&path, models, seen, cache, cache_dirty, max_depth - 1);
@@ -342,7 +396,7 @@ fn find_mmproj(model_path: &Path, model_filename: &str) -> Option<PathBuf> {
 
     // Extract the "model name + params" prefix, e.g. "Qwen3.5-4B" from "Qwen3.5-4B-Q4_K_M"
     // Strip trailing quant pattern to get the base name
-    let re = regex::Regex::new(r"[-_](?:IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
+    let re = regex::Regex::new(r"[-_](?:MXFP\d|IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
     let base = re.replace(stem, "").to_string();
 
     // Split base into segments for matching
@@ -459,23 +513,99 @@ pub async fn download_model(
     _repo_id: &str,
     file: &HfFile,
     config: &AppConfig,
-    progress_cb: impl Fn(DownloadProgress),
+    progress_cb: impl Fn(DownloadProgress) + Send + Sync,
 ) -> Result<PathBuf> {
     let models_dir = config.models_dir()?;
     std::fs::create_dir_all(&models_dir)?;
 
-    let dest_path = models_dir.join(&file.filename);
-    let tmp_path = models_dir.join(format!("__downloading__{}", file.filename));
+    if !file.split_parts.is_empty() {
+        return download_split_model(client, file, &models_dir, &progress_cb).await;
+    }
+
+    download_single_file(client, &file.filename, &file.download_url, file.size_bytes, &models_dir, &progress_cb).await
+}
+
+/// Download all parts of a split GGUF model, reporting combined progress.
+async fn download_split_model(
+    client: &reqwest::Client,
+    file: &HfFile,
+    models_dir: &Path,
+    progress_cb: &(dyn Fn(DownloadProgress) + Send + Sync),
+) -> Result<PathBuf> {
+    let total_bytes = file.size_bytes;
+    let display_id = file.filename.clone();
+    let mut completed_bytes: u64 = 0;
+
+    let first_dest = models_dir.join(&file.split_parts[0].filename);
+
+    for part in &file.split_parts {
+        let dest_path = models_dir.join(&part.filename);
+
+        // Skip already completed parts
+        if dest_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&dest_path) {
+                if part.size_bytes > 0 && meta.len() == part.size_bytes {
+                    completed_bytes += part.size_bytes;
+                    continue;
+                }
+            }
+        }
+
+        let base = completed_bytes;
+        let id = display_id.clone();
+        let total = total_bytes;
+
+        let part_cb = move |p: DownloadProgress| {
+            if p.status == "done" {
+                return; // Don't forward individual part "done"
+            }
+            progress_cb(DownloadProgress {
+                id: id.clone(),
+                bytes_downloaded: base + p.bytes_downloaded,
+                total_bytes: total,
+                percent: if total > 0 { ((base + p.bytes_downloaded) as f64 / total as f64) * 100.0 } else { 0.0 },
+                status: p.status,
+            });
+        };
+
+        download_single_file(client, &part.filename, &part.download_url, part.size_bytes, models_dir, &part_cb).await?;
+
+        completed_bytes += part.size_bytes;
+    }
+
+    // All parts done
+    progress_cb(DownloadProgress {
+        id: display_id,
+        bytes_downloaded: total_bytes,
+        total_bytes,
+        percent: 100.0,
+        status: "done".to_string(),
+    });
+
+    Ok(first_dest)
+}
+
+/// Download a single file with resume support and exponential backoff.
+async fn download_single_file(
+    client: &reqwest::Client,
+    filename: &str,
+    download_url: &str,
+    size_bytes: u64,
+    models_dir: &Path,
+    progress_cb: &(dyn Fn(DownloadProgress) + Send + Sync),
+) -> Result<PathBuf> {
+    let dest_path = models_dir.join(filename);
+    let tmp_path = models_dir.join(format!("__downloading__{}", filename));
 
     // Check if already downloaded
     if dest_path.exists() {
         let existing_size = std::fs::metadata(&dest_path)?.len();
-        if file.size_bytes > 0 && existing_size == file.size_bytes {
+        if size_bytes > 0 && existing_size == size_bytes {
             return Ok(dest_path);
         }
     }
 
-    let total_bytes = file.size_bytes;
+    let total_bytes = size_bytes;
     let max_retries = 5u32;
     let backoff_secs: [u64; 6] = [0, 1, 2, 4, 8, 8];
     let mut consecutive_failures = 0u32;
@@ -491,7 +621,7 @@ pub async fn download_model(
         if consecutive_failures > 0 {
             let delay = backoff_secs[consecutive_failures.min(5) as usize];
             progress_cb(DownloadProgress {
-                id: file.filename.clone(),
+                id: filename.to_string(),
                 bytes_downloaded: resume_from,
                 total_bytes,
                 percent: if total_bytes > 0 { (resume_from as f64 / total_bytes as f64) * 100.0 } else { 0.0 },
@@ -504,22 +634,22 @@ pub async fn download_model(
 
         // Build request with Range header for resume
         let mut req = client
-            .get(&file.download_url)
+            .get(download_url)
             .header("User-Agent", "catapult-launcher/0.1");
 
         if resume_from > 0 {
             req = req.header("Range", format!("bytes={}-", resume_from));
-            log::info!("Resuming download of {} from byte {}", file.filename, resume_from);
+            log::info!("Resuming download of {} from byte {}", filename, resume_from);
         }
 
         let response = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 consecutive_failures += 1;
-                log::warn!("Download attempt failed for {} (failure {}/{}): {}", file.filename, consecutive_failures, max_retries, e);
+                log::warn!("Download attempt failed for {} (failure {}/{}): {}", filename, consecutive_failures, max_retries, e);
                 if consecutive_failures >= max_retries {
                     progress_cb(DownloadProgress {
-                        id: file.filename.clone(),
+                        id: filename.to_string(),
                         bytes_downloaded: resume_from,
                         total_bytes,
                         percent: if total_bytes > 0 { (resume_from as f64 / total_bytes as f64) * 100.0 } else { 0.0 },
@@ -534,10 +664,10 @@ pub async fn download_model(
         let status_code = response.status();
         if !status_code.is_success() && status_code.as_u16() != 206 {
             consecutive_failures += 1;
-            log::warn!("HTTP {} for {} (failure {}/{})", status_code, file.filename, consecutive_failures, max_retries);
+            log::warn!("HTTP {} for {} (failure {}/{})", status_code, filename, consecutive_failures, max_retries);
             if consecutive_failures >= max_retries {
                 progress_cb(DownloadProgress {
-                    id: file.filename.clone(),
+                    id: filename.to_string(),
                     bytes_downloaded: resume_from,
                     total_bytes,
                     percent: if total_bytes > 0 { (resume_from as f64 / total_bytes as f64) * 100.0 } else { 0.0 },
@@ -572,7 +702,7 @@ pub async fn download_model(
             match chunk_result {
                 Ok(chunk) => {
                     if let Err(e) = out_file.write_all(&chunk).await {
-                        log::warn!("Write error during download of {}: {}", file.filename, e);
+                        log::warn!("Write error during download of {}: {}", filename, e);
                         stream_error = true;
                         break;
                     }
@@ -585,7 +715,7 @@ pub async fn download_model(
                     };
 
                     progress_cb(DownloadProgress {
-                        id: file.filename.clone(),
+                        id: filename.to_string(),
                         bytes_downloaded: downloaded,
                         total_bytes,
                         percent,
@@ -593,7 +723,7 @@ pub async fn download_model(
                     });
                 }
                 Err(e) => {
-                    log::warn!("Stream error during download of {}: {}", file.filename, e);
+                    log::warn!("Stream error during download of {}: {}", filename, e);
                     stream_error = true;
                     break;
                 }
@@ -607,7 +737,7 @@ pub async fn download_model(
             // If we received new data before the error, reset the failure counter
             if downloaded > downloaded_at_start {
                 log::info!("Download of {} made progress ({} -> {} bytes), resetting retry counter",
-                    file.filename, downloaded_at_start, downloaded);
+                    filename, downloaded_at_start, downloaded);
                 consecutive_failures = 0;
             } else {
                 consecutive_failures += 1;
@@ -615,13 +745,13 @@ pub async fn download_model(
 
             if consecutive_failures >= max_retries {
                 progress_cb(DownloadProgress {
-                    id: file.filename.clone(),
+                    id: filename.to_string(),
                     bytes_downloaded: downloaded,
                     total_bytes,
                     percent: if total_bytes > 0 { (downloaded as f64 / total_bytes as f64) * 100.0 } else { 0.0 },
                     status: "paused".to_string(),
                 });
-                anyhow::bail!("Download of {} failed after {} consecutive retries (stream error)", file.filename, max_retries);
+                anyhow::bail!("Download of {} failed after {} consecutive retries (stream error)", filename, max_retries);
             }
             continue;
         }
@@ -630,7 +760,7 @@ pub async fn download_model(
         tokio::fs::rename(&tmp_path, &dest_path).await?;
 
         progress_cb(DownloadProgress {
-            id: file.filename.clone(),
+            id: filename.to_string(),
             bytes_downloaded: downloaded,
             total_bytes,
             percent: 100.0,
@@ -647,13 +777,39 @@ pub fn abort_download(filename: &str, config: &AppConfig) -> Result<()> {
     if tmp_path.exists() {
         std::fs::remove_file(&tmp_path)?;
     }
+
+    // For split models: also clean up temp files for other parts
+    if let Some((base, _, total)) = huggingface::parse_split_filename(filename) {
+        for i in 1..=total {
+            let part_name = format!("{}-{:05}-of-{:05}.gguf", base, i, total);
+            let tmp = models_dir.join(format!("__downloading__{}", part_name));
+            if tmp.exists() {
+                std::fs::remove_file(&tmp)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
 pub fn delete_model(path: &Path) -> Result<()> {
-    if path.exists() {
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    if let Some((base, _, total)) = huggingface::parse_split_filename(filename) {
+        // Delete all parts of the split model
+        if let Some(parent) = path.parent() {
+            for i in 1..=total {
+                let part_name = format!("{}-{:05}-of-{:05}.gguf", base, i, total);
+                let part_path = parent.join(part_name);
+                if part_path.exists() {
+                    std::fs::remove_file(&part_path)?;
+                }
+            }
+        }
+    } else if path.exists() {
         std::fs::remove_file(path)?;
     }
+
     Ok(())
 }
 
@@ -670,7 +826,7 @@ fn guess_repo_from_filename(filename: &str) -> (String, String) {
     let stem = filename.trim_end_matches(".gguf");
 
     // Strip trailing quant patterns
-    let re = regex::Regex::new(r"-(?:IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
+    let re = regex::Regex::new(r"-(?:MXFP\d|IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
     let name = re.replace(stem, "").to_string();
 
     (String::new(), name)
@@ -689,7 +845,7 @@ pub fn estimate_size_mb(params_b: u32, quant: &str) -> u64 {
     let bits_per_weight = match quant.to_uppercase().as_str() {
         q if q.starts_with("Q2") => 2.5_f64,
         q if q.starts_with("Q3") => 3.5,
-        q if q.starts_with("Q4") => 4.5,
+        q if q.starts_with("Q4") || q.starts_with("MXFP4") => 4.5,
         q if q.starts_with("Q5") => 5.5,
         q if q.starts_with("Q6") => 6.6,
         q if q.starts_with("Q8") => 8.5,

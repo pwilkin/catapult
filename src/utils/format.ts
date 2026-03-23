@@ -32,22 +32,22 @@ export function formatSize(bytes: number): string {
 }
 
 export function quantColor(quant: string): string {
-  const q = quant.toUpperCase().replace(/^IQ/, "Q");
+  const q = quant.toUpperCase().replace(/^IQ/, "Q").replace(/^MXFP/, "Q");
   if (q === "F16" || q === "BF16" || q === "F32") return "badge-blue";
   if (q.startsWith("Q8")) return "badge-blue";
   if (q.startsWith("Q7")) return "badge-blue";
-  if (q.startsWith("Q6")) return "badge-green";
+  if (q.startsWith("Q6")) return "badge-cyan";
   if (q.startsWith("Q5")) return "badge-green";
-  if (q.startsWith("Q4")) return "badge-green";
-  if (q.startsWith("Q3")) return "badge-yellow";
+  if (q.startsWith("Q4")) return "badge-yellow";
+  if (q.startsWith("Q3")) return "badge-orange";
   if (q.startsWith("Q2")) return "badge-red";
-  if (q.startsWith("Q1")) return "badge-red";
+  if (q.startsWith("Q1")) return "badge-red-dark";
   return "badge-gray";
 }
 
 export function quantSortKey(quant: string | null): number {
   if (!quant) return 999;
-  const q = quant.toUpperCase().replace(/^IQ/, "Q");
+  const q = quant.toUpperCase().replace(/^IQ/, "Q").replace(/^MXFP/, "Q");
   if (q === "F32") return 0;
   if (q === "BF16") return 1;
   if (q === "F16") return 2;

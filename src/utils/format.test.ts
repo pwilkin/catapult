@@ -97,28 +97,38 @@ describe("quantColor", () => {
     expect(quantColor("Q8_0")).toBe("badge-blue");
   });
 
-  test("Q4-Q6 are green", () => {
-    expect(quantColor("Q4_K_M")).toBe("badge-green");
-    expect(quantColor("Q5_K_S")).toBe("badge-green");
-    expect(quantColor("Q6_K")).toBe("badge-green");
+  test("Q6 is cyan", () => {
+    expect(quantColor("Q6_K")).toBe("badge-cyan");
   });
 
-  test("Q3 is yellow", () => {
-    expect(quantColor("Q3_K_M")).toBe("badge-yellow");
+  test("Q5 is green", () => {
+    expect(quantColor("Q5_K_S")).toBe("badge-green");
+  });
+
+  test("Q4 is yellow", () => {
+    expect(quantColor("Q4_K_M")).toBe("badge-yellow");
+  });
+
+  test("Q3 is orange", () => {
+    expect(quantColor("Q3_K_M")).toBe("badge-orange");
   });
 
   test("Q2 is red", () => {
     expect(quantColor("Q2_K")).toBe("badge-red");
   });
 
-  test("Q1 is red", () => {
-    expect(quantColor("Q1_0")).toBe("badge-red");
+  test("Q1 is dark red", () => {
+    expect(quantColor("Q1_0")).toBe("badge-red-dark");
   });
 
   test("IQ treated same as Q", () => {
-    expect(quantColor("IQ4_XS")).toBe("badge-green");
+    expect(quantColor("IQ4_XS")).toBe("badge-yellow");
     expect(quantColor("IQ2_XXS")).toBe("badge-red");
-    expect(quantColor("IQ3_M")).toBe("badge-yellow");
+    expect(quantColor("IQ3_M")).toBe("badge-orange");
+  });
+
+  test("MXFP4 treated as 4-bit", () => {
+    expect(quantColor("MXFP4")).toBe("badge-yellow");
   });
 
   test("unknown is gray", () => {

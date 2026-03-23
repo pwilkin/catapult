@@ -96,6 +96,7 @@ export interface ModelInfo {
   context_length: number | null;
   is_vision: boolean;
   mmproj_path: string | null;
+  split_files: string[];
 }
 
 export interface RecommendedModel {
@@ -126,6 +127,14 @@ export interface HfFile {
   filename: string;
   size_bytes: number;
   quant: string | null;
+  download_url: string;
+  is_split: boolean;
+  split_parts: HfFilePart[];
+}
+
+export interface HfFilePart {
+  filename: string;
+  size_bytes: number;
   download_url: string;
 }
 

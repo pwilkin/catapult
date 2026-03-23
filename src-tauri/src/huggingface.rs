@@ -160,6 +160,17 @@ pub struct HfFile {
     pub size_bytes: u64,
     pub quant: Option<String>,
     pub download_url: String,
+    #[serde(default)]
+    pub is_split: bool,
+    #[serde(default)]
+    pub split_parts: Vec<HfFilePart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HfFilePart {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub download_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,28 +233,151 @@ struct HfTreeEntry {
     path: String,
 }
 
-pub async fn get_repo_files(client: &reqwest::Client, repo_id: &str) -> Result<Vec<HfFile>> {
-    // Use the tree API which reliably includes file sizes
-    let url = format!(
-        "https://huggingface.co/api/models/{}/tree/main",
-        repo_id
-    );
-    let response = client
-        .get(&url)
-        .header("User-Agent", "catapult-launcher/0.1")
-        .send()
-        .await
-        .context("Failed to fetch repo tree")?;
+/// Check if a filename is an imatrix/importance matrix file (not a model).
+pub fn is_imatrix_file(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.contains("imatrix") || lower.contains("importance_matrix")
+}
 
-    if !response.status().is_success() {
-        anyhow::bail!("HuggingFace API error: {}", response.status());
+/// Parse a split GGUF filename like `model-00001-of-00003.gguf`.
+/// Returns (base_name, part_number, total_parts).
+pub fn parse_split_filename(filename: &str) -> Option<(String, u32, u32)> {
+    let name = filename.rsplit('/').next().unwrap_or(filename);
+    let re = regex::Regex::new(r"^(.+)-(\d{5})-of-(\d{5})\.gguf$").ok()?;
+    let caps = re.captures(name)?;
+    let base = caps.get(1)?.as_str().to_string();
+    let part: u32 = caps.get(2)?.as_str().parse().ok()?;
+    let total: u32 = caps.get(3)?.as_str().parse().ok()?;
+    Some((base, part, total))
+}
+
+/// Grouping key for split files: includes directory prefix so files in
+/// different subdirs don't get merged.
+fn split_group_key(path: &str) -> Option<String> {
+    let dir_prefix = match path.rfind('/') {
+        Some(pos) => &path[..=pos],
+        None => "",
+    };
+    let (base, _, total) = parse_split_filename(path)?;
+    Some(format!("{}{}-{:05}", dir_prefix, base, total))
+}
+
+/// Consolidate split GGUF files into single entries and strip subdirectory
+/// prefixes from filenames (download URLs keep the full path).
+fn consolidate_files(files: Vec<HfFile>) -> Vec<HfFile> {
+    use std::collections::BTreeMap;
+
+    let mut singles: Vec<HfFile> = Vec::new();
+    let mut split_groups: BTreeMap<String, Vec<HfFile>> = BTreeMap::new();
+
+    for file in files {
+        if let Some(key) = split_group_key(&file.filename) {
+            split_groups.entry(key).or_default().push(file);
+        } else {
+            // Strip directory prefix for flat download
+            let basename = file.filename.rsplit('/').next().unwrap_or(&file.filename).to_string();
+            singles.push(HfFile {
+                filename: basename,
+                is_split: false,
+                split_parts: vec![],
+                ..file
+            });
+        }
     }
 
-    let entries: Vec<HfTreeEntry> = response.json().await.context("Failed to parse tree response")?;
+    for (_key, mut parts) in split_groups {
+        parts.sort_by_key(|f| {
+            parse_split_filename(&f.filename).map(|(_, n, _)| n).unwrap_or(0)
+        });
 
-    let files = entries
+        let total_size: u64 = parts.iter().map(|p| p.size_bytes).sum();
+        let quant = parts[0].quant.clone();
+
+        let split_parts: Vec<HfFilePart> = parts
+            .iter()
+            .map(|p| {
+                let basename = p.filename.rsplit('/').next().unwrap_or(&p.filename).to_string();
+                HfFilePart {
+                    filename: basename,
+                    size_bytes: p.size_bytes,
+                    download_url: p.download_url.clone(),
+                }
+            })
+            .collect();
+
+        let first = &parts[0];
+        let first_basename = first.filename.rsplit('/').next().unwrap_or(&first.filename).to_string();
+
+        singles.push(HfFile {
+            filename: first_basename,
+            size_bytes: total_size,
+            quant,
+            download_url: first.download_url.clone(),
+            is_split: true,
+            split_parts,
+        });
+    }
+
+    singles
+}
+
+/// Recursively fetch the HuggingFace tree API, following directories up to max_depth.
+fn fetch_tree_recursive<'a>(
+    client: &'a reqwest::Client,
+    repo_id: &'a str,
+    path: &'a str,
+    max_depth: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<HfTreeEntry>>> + Send + 'a>> {
+    Box::pin(async move {
+        if max_depth == 0 {
+            return Ok(vec![]);
+        }
+
+        let url = if path.is_empty() {
+            format!("https://huggingface.co/api/models/{}/tree/main", repo_id)
+        } else {
+            format!(
+                "https://huggingface.co/api/models/{}/tree/main/{}",
+                repo_id, path
+            )
+        };
+
+        let response = client
+            .get(&url)
+            .header("User-Agent", "catapult-launcher/0.1")
+            .send()
+            .await
+            .context("Failed to fetch repo tree")?;
+
+        if !response.status().is_success() {
+            // Don't fail on subdirectory errors — just skip
+            return Ok(vec![]);
+        }
+
+        let entries: Vec<HfTreeEntry> = response.json().await.unwrap_or_default();
+        let mut result = Vec::new();
+
+        for entry in entries {
+            if entry.entry_type == "directory" {
+                let sub = fetch_tree_recursive(client, repo_id, &entry.path, max_depth - 1).await?;
+                result.extend(sub);
+            } else {
+                result.push(entry);
+            }
+        }
+
+        Ok(result)
+    })
+}
+
+pub async fn get_repo_files(client: &reqwest::Client, repo_id: &str) -> Result<Vec<HfFile>> {
+    // Recursively fetch tree (depth 3 covers subdirectory-organized repos)
+    let entries = fetch_tree_recursive(client, repo_id, "", 3).await?;
+
+    let files: Vec<HfFile> = entries
         .into_iter()
         .filter(|e| e.entry_type == "file" && e.path.ends_with(".gguf"))
+        .filter(|e| !is_imatrix_file(&e.path))
         .map(|e| {
             let quant = extract_quant(&e.path);
             let download_url = format!(
@@ -255,11 +389,13 @@ pub async fn get_repo_files(client: &reqwest::Client, repo_id: &str) -> Result<V
                 size_bytes: e.size.unwrap_or(0),
                 quant,
                 download_url,
+                is_split: false,
+                split_parts: vec![],
             }
         })
         .collect();
 
-    Ok(files)
+    Ok(consolidate_files(files))
 }
 
 fn convert_model(m: HfApiModel) -> HfModel {
@@ -269,11 +405,12 @@ fn convert_model(m: HfApiModel) -> HfModel {
     });
     let name = repo_id.split('/').last().unwrap_or(&repo_id).to_string();
 
-    let files = m
+    let files: Vec<HfFile> = m
         .siblings
         .unwrap_or_default()
         .into_iter()
         .filter(|f| f.rfilename.ends_with(".gguf"))
+        .filter(|f| !is_imatrix_file(&f.rfilename))
         .map(|f| {
             let quant = extract_quant(&f.rfilename);
             let download_url = format!(
@@ -285,9 +422,13 @@ fn convert_model(m: HfApiModel) -> HfModel {
                 size_bytes: f.size.unwrap_or(0),
                 quant,
                 download_url,
+                is_split: false,
+                split_parts: vec![],
             }
         })
         .collect();
+
+    let files = consolidate_files(files);
 
     HfModel {
         repo_id,
@@ -301,8 +442,8 @@ fn convert_model(m: HfApiModel) -> HfModel {
 }
 
 pub fn extract_quant(filename: &str) -> Option<String> {
-    // Match patterns like Q4_K_M, Q8_0, F16, IQ2_XXS, etc.
-    let re = regex::Regex::new(r"(?i)(IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)").ok()?;
+    // Match patterns like Q4_K_M, Q8_0, F16, IQ2_XXS, MXFP4, etc.
+    let re = regex::Regex::new(r"(?i)(MXFP\d|IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)").ok()?;
     re.find(filename).map(|m| m.as_str().to_uppercase())
 }
 
@@ -334,6 +475,12 @@ mod tests {
     }
 
     #[test]
+    fn extract_quant_mxfp() {
+        assert_eq!(extract_quant("gpt-oss-20b-MXFP4.gguf"), Some("MXFP4".into()));
+        assert_eq!(extract_quant("model-mxfp4.gguf"), Some("MXFP4".into()));
+    }
+
+    #[test]
     fn extract_quant_no_match() {
         assert_eq!(extract_quant("model.gguf"), None);
         assert_eq!(extract_quant("README.md"), None);
@@ -344,5 +491,100 @@ mod tests {
     fn extract_quant_case_insensitive() {
         assert_eq!(extract_quant("model-q4_k_m.gguf"), Some("Q4_K_M".to_string()));
         assert_eq!(extract_quant("model-f16.gguf"), Some("F16".to_string()));
+    }
+
+    #[test]
+    fn parse_split_filename_valid() {
+        let (base, part, total) = parse_split_filename("model-Q4_K_M-00001-of-00003.gguf").unwrap();
+        assert_eq!(base, "model-Q4_K_M");
+        assert_eq!(part, 1);
+        assert_eq!(total, 3);
+
+        let (base, part, total) = parse_split_filename("model-00003-of-00005.gguf").unwrap();
+        assert_eq!(base, "model");
+        assert_eq!(part, 3);
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn parse_split_filename_with_subdir() {
+        // Should parse basename only, ignoring directory prefix
+        let (base, part, total) = parse_split_filename("Q4_K_M/model-Q4_K_M-00001-of-00003.gguf").unwrap();
+        assert_eq!(base, "model-Q4_K_M");
+        assert_eq!(part, 1);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn parse_split_filename_not_split() {
+        assert!(parse_split_filename("model-Q4_K_M.gguf").is_none());
+        assert!(parse_split_filename("model.gguf").is_none());
+        assert!(parse_split_filename("").is_none());
+    }
+
+    #[test]
+    fn imatrix_detection() {
+        assert!(is_imatrix_file("imatrix.dat"));
+        assert!(is_imatrix_file("model-imatrix-Q4_K_M.gguf"));
+        assert!(is_imatrix_file("importance_matrix.dat"));
+        assert!(!is_imatrix_file("model-Q4_K_M.gguf"));
+        assert!(!is_imatrix_file("model-00001-of-00003.gguf"));
+    }
+
+    #[test]
+    fn consolidate_groups_split_files() {
+        let files = vec![
+            HfFile {
+                filename: "Q4_K_M/model-Q4_K_M-00002-of-00003.gguf".into(),
+                size_bytes: 200,
+                quant: Some("Q4_K_M".into()),
+                download_url: "https://example.com/Q4_K_M/model-Q4_K_M-00002-of-00003.gguf".into(),
+                is_split: false,
+                split_parts: vec![],
+            },
+            HfFile {
+                filename: "Q4_K_M/model-Q4_K_M-00001-of-00003.gguf".into(),
+                size_bytes: 200,
+                quant: Some("Q4_K_M".into()),
+                download_url: "https://example.com/Q4_K_M/model-Q4_K_M-00001-of-00003.gguf".into(),
+                is_split: false,
+                split_parts: vec![],
+            },
+            HfFile {
+                filename: "Q4_K_M/model-Q4_K_M-00003-of-00003.gguf".into(),
+                size_bytes: 200,
+                quant: Some("Q4_K_M".into()),
+                download_url: "https://example.com/Q4_K_M/model-Q4_K_M-00003-of-00003.gguf".into(),
+                is_split: false,
+                split_parts: vec![],
+            },
+            HfFile {
+                filename: "single-Q8_0.gguf".into(),
+                size_bytes: 500,
+                quant: Some("Q8_0".into()),
+                download_url: "https://example.com/single-Q8_0.gguf".into(),
+                is_split: false,
+                split_parts: vec![],
+            },
+        ];
+
+        let result = consolidate_files(files);
+        assert_eq!(result.len(), 2, "should consolidate 3 split parts + 1 single into 2 entries");
+
+        let single = result.iter().find(|f| !f.is_split).unwrap();
+        assert_eq!(single.filename, "single-Q8_0.gguf");
+        assert_eq!(single.size_bytes, 500);
+
+        let split = result.iter().find(|f| f.is_split).unwrap();
+        assert_eq!(split.filename, "model-Q4_K_M-00001-of-00003.gguf");
+        assert_eq!(split.size_bytes, 600); // 200 * 3
+        assert_eq!(split.split_parts.len(), 3);
+        // Parts should be sorted by number
+        assert!(split.split_parts[0].filename.contains("00001"));
+        assert!(split.split_parts[1].filename.contains("00002"));
+        assert!(split.split_parts[2].filename.contains("00003"));
+        // Subdirectory should be stripped from filenames
+        assert!(!split.filename.contains('/'));
+        assert!(!split.split_parts[0].filename.contains('/'));
     }
 }

@@ -7,7 +7,7 @@ mod server;
 
 use config::AppConfig;
 use hardware::{suggest_config, BackendInfo, SystemInfo};
-use huggingface::{HfFile, HfModel, KNOWN_GGUF_OWNERS};
+use huggingface::{HfFile, HfFilePart, HfModel, KNOWN_GGUF_OWNERS};
 use models::{ModelInfo, RecommendedModel};
 use runtime::{CustomBuild, ReleaseInfo, RuntimeInfo};
 use server::{ServerConfig, ServerStatus, SharedServerState};
@@ -273,15 +273,23 @@ async fn download_model(
     filename: String,
     download_url: String,
     size_bytes: u64,
+    split_parts: Option<Vec<HfFilePart>>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let config = state.config.lock().unwrap().clone();
+
+    let (is_split, parts) = match split_parts {
+        Some(parts) if !parts.is_empty() => (true, parts),
+        _ => (false, vec![]),
+    };
 
     let file = HfFile {
         filename: filename.clone(),
         size_bytes,
         quant: huggingface::extract_quant(&filename),
         download_url,
+        is_split,
+        split_parts: parts,
     };
 
     // Mark download active

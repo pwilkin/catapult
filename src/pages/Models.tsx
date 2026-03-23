@@ -162,6 +162,7 @@ export default function Models() {
         filename: file.filename,
         downloadUrl: file.download_url,
         sizeBytes: file.size_bytes,
+        splitParts: file.is_split && file.split_parts.length > 0 ? file.split_parts : null,
       });
     } catch (e) {
       // Error is expected when retries exhausted — paused status is already set via event
@@ -492,6 +493,8 @@ export default function Models() {
                               size_bytes: m.estimated_size_mb * 1024 * 1024,
                               quant: m.quant,
                               download_url: `https://huggingface.co/${m.repo_id}/resolve/main/${m.filename}`,
+                              is_split: false,
+                              split_parts: [],
                             })
                           }
                         >
@@ -530,6 +533,8 @@ export default function Models() {
                               size_bytes: m.estimated_size_mb * 1024 * 1024,
                               quant: m.quant,
                               download_url: `https://huggingface.co/${m.repo_id}/resolve/main/${m.filename}`,
+                              is_split: false,
+                              split_parts: [],
                             })
                           }>
                             Resume
@@ -623,8 +628,9 @@ export default function Models() {
                           repoFiles[model.repo_id].length > 0 ? (
                             repoFiles[model.repo_id].map((f) => {
                               const dl = downloads[f.filename];
+                              const hfBasename = f.filename.includes('/') ? f.filename.split('/').pop()! : f.filename;
                               const isInstalled = installed.some(
-                                (m) => m.filename === f.filename
+                                (m) => m.filename === hfBasename
                               );
                               return (
                                 <div
@@ -635,9 +641,16 @@ export default function Models() {
                                     <span className="text-xs text-gray-300 font-mono truncate block">
                                       {f.filename}
                                     </span>
-                                    {f.quant && (
-                                      <QuantBadge quant={f.quant} />
-                                    )}
+                                    <div className="flex items-center gap-1.5 mt-0.5">
+                                      {f.quant && (
+                                        <QuantBadge quant={f.quant} />
+                                      )}
+                                      {f.is_split && (
+                                        <span className="badge-gray text-[10px]">
+                                          {f.split_parts.length} parts
+                                        </span>
+                                      )}
+                                    </div>
                                   </div>
                                   <span className="text-xs text-gray-500 shrink-0">
                                     {formatSize(f.size_bytes)}
