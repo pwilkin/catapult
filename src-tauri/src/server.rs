@@ -169,6 +169,7 @@ pub async fn start_server(
     let state_clone = state.clone();
     let log_cb = Arc::new(log_cb);
     let log_cb_clone = log_cb.clone();
+    let log_cb_exit = log_cb.clone();
 
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
@@ -258,9 +259,11 @@ pub async fn start_server(
                     } else if status.success() {
                         s.status = ServerStatus::Stopped;
                     } else {
-                        s.status = ServerStatus::Error {
-                            message: format!("Server exited with code {}", status),
-                        };
+                        let msg = format!("Server exited with code {}", status);
+                        s.log_lines.push(format!("[error] {}", msg));
+                        s.status = ServerStatus::Error { message: msg.clone() };
+                        drop(s);
+                        log_cb_exit(format!("[error] {}", msg));
                     }
                     break;
                 }
@@ -268,9 +271,11 @@ pub async fn start_server(
                 Err(e) => {
                     let mut s = state_clone3.lock().unwrap();
                     s.process = None;
-                    s.status = ServerStatus::Error {
-                        message: format!("Server process error: {}", e),
-                    };
+                    let msg = format!("Server process error: {}", e);
+                    s.log_lines.push(format!("[error] {}", msg));
+                    s.status = ServerStatus::Error { message: msg.clone() };
+                    drop(s);
+                    log_cb_exit(format!("[error] {}", msg));
                     break;
                 }
             }
