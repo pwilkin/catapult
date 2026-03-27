@@ -178,6 +178,7 @@ const DEFAULT_CONFIG: ServerConfig = {
 const SESSION_CONFIG_KEY = "catapult_server_config";
 const SESSION_PRESET_KEY = "catapult_server_preset";
 const SESSION_TAB_KEY = "catapult_server_tab";
+const SESSION_STATUS_KEY = "catapult_server_status";
 
 function loadSessionConfig(): ServerConfig | null {
   try {
@@ -186,11 +187,18 @@ function loadSessionConfig(): ServerConfig | null {
   } catch { return null; }
 }
 
+function loadSessionStatus(): ServerStatus {
+  try {
+    const raw = sessionStorage.getItem(SESSION_STATUS_KEY);
+    return raw ? JSON.parse(raw) : { type: "stopped" };
+  } catch { return { type: "stopped" }; }
+}
+
 export default function Server() {
   const navigate = useNavigate();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [config, setConfigRaw] = useState<ServerConfig>(() => loadSessionConfig() ?? DEFAULT_CONFIG);
-  const [status, setStatus] = useState<ServerStatus>({ type: "stopped" });
+  const [status, setStatusRaw] = useState<ServerStatus>(loadSessionStatus);
   const [logs, setLogs] = useState<string[]>([]);
   const [activeTab, setActiveTabRaw] = useState<Tab>(() => {
     const saved = sessionStorage.getItem(SESSION_TAB_KEY);
@@ -229,6 +237,14 @@ export default function Server() {
   const setActiveTab = useCallback((v: Tab) => {
     setActiveTabRaw(v);
     sessionStorage.setItem(SESSION_TAB_KEY, v);
+  }, []);
+
+  const setStatus = useCallback((v: ServerStatus | ((prev: ServerStatus) => ServerStatus)) => {
+    setStatusRaw((prev) => {
+      const next = typeof v === "function" ? v(prev) : v;
+      sessionStorage.setItem(SESSION_STATUS_KEY, JSON.stringify(next));
+      return next;
+    });
   }, []);
 
   const flushLogs = useCallback(() => {
