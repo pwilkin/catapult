@@ -9,6 +9,10 @@ edition = "2021"
 name = "catapult_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "catapult-tui"
+path = "src/tui_main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -30,6 +34,10 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], defau
 anyhow = "1"
 thiserror = "1"
 log = "0.4"
+
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+tui-input = "0.11"
 
 dirs = "5"
 zip = "0.6"

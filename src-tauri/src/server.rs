@@ -333,7 +333,7 @@ pub async fn stop_server(state: &SharedServerState) -> Result<()> {
     Ok(())
 }
 
-fn build_args(config: &ServerConfig) -> Vec<String> {
+pub fn build_args(config: &ServerConfig) -> Vec<String> {
     let mut args = Vec::new();
 
     args.push("--model".to_string());

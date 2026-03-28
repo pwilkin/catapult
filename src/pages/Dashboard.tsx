@@ -92,7 +92,14 @@ export default function Dashboard() {
         modelPath: launchModel.path,
         modelSizeMb: Math.round(launchModel.size_bytes / (1024 * 1024)),
       });
-      await invoke("start_server", { config: suggested });
+      let config = suggested;
+      try {
+        const defaults = await invoke<ServerConfig>("load_server_preset", { name: "__default__" });
+        config = { ...suggested, ...defaults, model_path: suggested.model_path, mmproj_path: suggested.mmproj_path };
+      } catch {
+        // No saved defaults — use suggested config as-is
+      }
+      await invoke("start_server", { config });
     } catch (e) {
       setError(String(e));
     } finally {

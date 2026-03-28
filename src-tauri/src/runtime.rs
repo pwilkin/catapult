@@ -127,7 +127,16 @@ pub fn find_server_binary(runtime_dir: &Path) -> Option<PathBuf> {
     find_file_recursive(runtime_dir, target, 3)
 }
 
-fn find_file_recursive(dir: &Path, name: &str, max_depth: u32) -> Option<PathBuf> {
+pub fn find_chat_binary(runtime_dir: &Path) -> Option<PathBuf> {
+    let target = if cfg!(target_os = "windows") {
+        "llama-cli.exe"
+    } else {
+        "llama-cli"
+    };
+    find_file_recursive(runtime_dir, target, 3)
+}
+
+pub fn find_file_recursive(dir: &Path, name: &str, max_depth: u32) -> Option<PathBuf> {
     if max_depth == 0 {
         return None;
     }

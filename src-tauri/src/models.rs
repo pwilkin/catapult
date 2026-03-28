@@ -356,6 +356,7 @@ fn scan_gguf_recursive(
 
             let name = cached_meta.name
                 .map(|n| n.rsplit('/').next().unwrap_or(&n).to_string())
+                .filter(|n| n.len() >= 4) // Ignore suspiciously short GGUF names
                 .unwrap_or(fallback_name);
             let params_b = cached_meta.size_label
                 .or_else(|| extract_params_from_filename(&filename).map(|p| format!("{}B", p)));

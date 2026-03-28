@@ -1,9 +1,9 @@
-mod config;
-mod hardware;
-mod huggingface;
-mod models;
-mod runtime;
-mod server;
+pub mod config;
+pub mod hardware;
+pub mod huggingface;
+pub mod models;
+pub mod runtime;
+pub mod server;
 
 use config::AppConfig;
 use hardware::{suggest_config, BackendInfo, SystemInfo};
