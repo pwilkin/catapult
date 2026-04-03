@@ -754,6 +754,7 @@ export default function Server() {
                 onChange={(v) => setConfig((c) => ({ ...c, no_mmap: !v }))} />
               <Toggle label="Direct IO" hint="Use DirectIO if available" checked={hasFlag("direct-io")} onChange={(v) => setFlag("direct-io", v)} />
               <Toggle label="CPU MoE" hint="Keep all MoE weights on CPU" checked={hasFlag("cpu-moe")} onChange={(v) => setFlag("cpu-moe", v)} />
+              <Toggle label="CPU MoE (Draft)" hint="Keep all MoE weights on CPU for draft model" checked={hasFlag("cpu-moe-draft")} onChange={(v) => setFlag("cpu-moe-draft", v)} />
               <Toggle label="Repack" hint="Enable weight repacking (default: on)" checked={!hasFlag("no-repack")} onChange={(v) => setFlag("no-repack", !v)} />
               <Toggle label="Op Offload" hint="Offload host tensor ops to device (default: on)" checked={!hasFlag("no-op-offload")} onChange={(v) => setFlag("no-op-offload", !v)} />
               <Toggle label="No Host Buffer" hint="Bypass host buffer for extra device buffers" checked={hasFlag("no-host")} onChange={(v) => setFlag("no-host", v)} />
@@ -762,12 +763,16 @@ export default function Server() {
             <div className="grid grid-cols-2 gap-3 mt-2">
               <NumberInput label="N CPU MoE Layers" hint="Keep MoE weights of first N layers on CPU" value={getEpNum("n-cpu-moe")} min={0}
                 onChange={(v) => setEpNum("n-cpu-moe", v)} />
+              <NumberInput label="N CPU MoE Layers (Draft)" hint="Keep MoE weights of first N layers on CPU for draft" value={getEpNum("n-cpu-moe-draft")} min={0}
+                onChange={(v) => setEpNum("n-cpu-moe-draft", v)} />
             </div>
 
             <Section title="Overrides" />
             <div className="grid grid-cols-1 gap-3">
               <TextInput label="Override Tensor" hint="<pattern>=<buffer type>,... e.g. attn_v=cuda0" value={getEp("override-tensor")}
                 onChange={(v) => setEp("override-tensor", v)} />
+              <TextInput label="Override Tensor (Draft)" hint="Tensor buffer type override for draft model: <pattern>=<type>,..." value={getEp("override-tensor-draft")}
+                onChange={(v) => setEp("override-tensor-draft", v)} />
               <TextInput label="Override KV" hint="KEY=TYPE:VALUE,... e.g. tokenizer.ggml.add_bos_token=bool:false" value={getEp("override-kv")}
                 onChange={(v) => setEp("override-kv", v)} />
             </div>
@@ -882,6 +887,9 @@ export default function Server() {
               <NumberInput label="Sleep Idle (s)" hint="Sleep after N seconds idle (-1=disabled)" value={getEpNum("sleep-idle-seconds")}
                 onChange={(v) => setEpNum("sleep-idle-seconds", v)} />
             </div>
+            <div className="space-y-3 mt-2">
+              <Toggle label="Reuse Port" hint="Allow multiple sockets to bind to the same port" checked={hasFlag("reuse-port")} onChange={(v) => setFlag("reuse-port", v)} />
+            </div>
 
             <Section title="API" />
             <div className="grid grid-cols-2 gap-3">
@@ -912,6 +920,16 @@ export default function Server() {
               <Toggle label="Reranking" hint="Enable reranking endpoint" checked={hasFlag("reranking")} onChange={(v) => setFlag("reranking", v)} />
               <Toggle label="Warmup" hint="Perform warmup run on start (default: on)" checked={!hasFlag("no-warmup")} onChange={(v) => setFlag("no-warmup", !v)} />
             </div>
+            <div className="grid grid-cols-1 gap-3 mt-2">
+              <TextInput label="Tools (EXPERIMENTAL)" hint="Built-in tools to enable: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, apply_diff, or 'all'"
+                value={getEp("tools")} onChange={(v) => setEp("tools", v)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <TextInput label="Embedding Separator" hint="Separator between embeddings (default: \\n)" value={getEp("embd-separator")}
+                onChange={(v) => setEp("embd-separator", v)} />
+              <TextInput label="Classification Separator" hint="Separator for classification sequences (default: \\t)" value={getEp("cls-separator")}
+                onChange={(v) => setEp("cls-separator", v)} />
+            </div>
 
             <Section title="SSL" />
             <div className="grid grid-cols-2 gap-3">
@@ -926,8 +944,10 @@ export default function Server() {
                 onChange={(v) => setEp("slot-save-path", v)} />
               <TextInput label="Media Path" hint="Directory for local media files" value={getEp("media-path")}
                 onChange={(v) => setEp("media-path", v)} />
-              <TextInput label="WebUI Config" hint="JSON overriding WebUI defaults" value={getEp("webui-config")}
+              <TextInput label="WebUI Config (JSON)" hint="JSON string overriding WebUI defaults" value={getEp("webui-config")}
                 onChange={(v) => setEp("webui-config", v)} />
+              <TextInput label="WebUI Config File" hint="JSON file providing default WebUI settings" value={getEp("webui-config-file")}
+                onChange={(v) => setEp("webui-config-file", v)} />
             </div>
           </>}
 
@@ -1022,8 +1042,26 @@ export default function Server() {
                 onChange={(v) => setEpNum("ctx-size-draft", v)} />
               <NumberInput label="Draft GPU Layers" value={getEpNum("n-gpu-layers-draft")}
                 onChange={(v) => setEpNum("n-gpu-layers-draft", v)} />
-              <NumberInput label="Draft Threads" value={getEpNum("threads-draft")}
+              <NumberInput label="Draft Threads" hint="CPU threads for draft model generation" value={getEpNum("threads-draft")}
                 onChange={(v) => setEpNum("threads-draft", v)} />
+              <NumberInput label="Draft Batch Threads" hint="Threads for draft model batch/prompt processing" value={getEpNum("threads-batch-draft")}
+                onChange={(v) => setEpNum("threads-batch-draft", v)} />
+              <TextInput label="Draft Device" hint="Devices for draft model, comma-separated" value={getEp("device-draft")}
+                onChange={(v) => setEp("device-draft", v)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <NumberInput label="N-gram Size N" hint="N-gram size N for ngram-simple/ngram-map speculation" value={getEpNum("spec-ngram-size-n")} min={1}
+                onChange={(v) => setEpNum("spec-ngram-size-n", v)} />
+              <NumberInput label="N-gram Size M" hint="N-gram size M for ngram-simple/ngram-map speculation" value={getEpNum("spec-ngram-size-m")} min={1}
+                onChange={(v) => setEpNum("spec-ngram-size-m", v)} />
+              <NumberInput label="N-gram Min Hits" hint="Minimum hits for ngram-map speculation" value={getEpNum("spec-ngram-min-hits")} min={0}
+                onChange={(v) => setEpNum("spec-ngram-min-hits", v)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <TextInput label="Lookup Cache (Static)" hint="Read-only lookup cache file for lookup decoding" value={getEp("lookup-cache-static")}
+                onChange={(v) => setEp("lookup-cache-static", v)} />
+              <TextInput label="Lookup Cache (Dynamic)" hint="Lookup cache file updated by generation" value={getEp("lookup-cache-dynamic")}
+                onChange={(v) => setEp("lookup-cache-dynamic", v)} />
             </div>
 
             <Section title="LoRA & Control Vectors" />
@@ -1059,6 +1097,15 @@ export default function Server() {
                 checked={!hasFlag("no-mmproj")} onChange={(v) => setFlag("no-mmproj", !v)} />
             </div>
 
+            <Section title="TTS / Audio" />
+            <div className="grid grid-cols-2 gap-3">
+              <TextInput label="Vocoder Model" hint="Path to vocoder model for audio/TTS generation" value={getEp("model-vocoder")}
+                onChange={(v) => setEp("model-vocoder", v)} />
+            </div>
+            <div className="space-y-3 mt-2">
+              <Toggle label="TTS Guide Tokens" hint="Use guide tokens to improve TTS word recall" checked={hasFlag("tts-use-guide-tokens")} onChange={(v) => setFlag("tts-use-guide-tokens", v)} />
+            </div>
+
             <Section title="CPU Affinity" />
             <div className="grid grid-cols-2 gap-3">
               <TextInput label="CPU Mask" hint="Hex affinity mask" value={getEp("cpu-mask")} onChange={(v) => setEp("cpu-mask", v)} />
@@ -1089,6 +1136,11 @@ export default function Server() {
               <Toggle label="Log Prefix" hint="Add prefix to log messages" checked={hasFlag("log-prefix")} onChange={(v) => setFlag("log-prefix", v)} />
               <Toggle label="Log Timestamps" hint="Add timestamps to log messages" checked={hasFlag("log-timestamps")} onChange={(v) => setFlag("log-timestamps", v)} />
               <Toggle label="Offline" hint="Prevent network access, use cache only" checked={hasFlag("offline")} onChange={(v) => setFlag("offline", v)} />
+              <Toggle label="Profile" hint="Enable cross-backend profiling (CPU, BLAS, CUDA)" checked={hasFlag("profile")} onChange={(v) => setFlag("profile", v)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <TextInput label="Profile Output" hint="Write profiling JSON to file (default: stdout)" value={getEp("profile-output")}
+                onChange={(v) => setEp("profile-output", v)} />
             </div>
 
             <Section title="Extra Arguments" />

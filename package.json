@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "ui": "tauri dev",
+    "ui": "tauri dev -- --bin catapult",
     "tui": "cargo run --manifest-path src-tauri/Cargo.toml --bin catapult-tui",
     "build": "tauri build",
     "vite": "vite",
