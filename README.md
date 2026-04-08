@@ -1,10 +1,16 @@
 # Catapult
 
-A desktop GUI launcher for [llama.cpp](https://github.com/ggml-org/llama.cpp). Manages runtime versions, discovers and downloads models, configures the server with full parameter coverage, and provides an embedded chat interface — all without touching the command line.
+A desktop launcher for [llama.cpp](https://github.com/ggml-org/llama.cpp). Manages runtime versions, discovers and downloads models, configures the server with full parameter coverage, and provides an embedded chat interface — all without touching the command line.
 
-Built with [Tauri v2](https://v2.tauri.app/) (Rust backend + React/TypeScript frontend).
+Available in two interfaces:
+- **GUI** — A Tauri v2 desktop application (Rust backend + React/TypeScript frontend)
+- **TUI** — A terminal-based interface built with [ratatui](https://github.com/ratatui/ratatui) for those who prefer the command line
 
 ## Features
+
+**Dual Interface**
+- **GUI**: Full desktop experience with visual dashboards, tabbed configuration, and embedded WebUI
+- **TUI**: Fast keyboard-driven terminal interface with the same feature set
 
 **Runtime Management**
 - Download managed llama.cpp builds from GitHub releases with automatic platform/backend detection
@@ -27,10 +33,10 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend + React/TypeScript fr
 - One-click launch from the dashboard
 
 **Chat**
-- Embedded llama.cpp WebUI in-app via iframe
-- Pop-out to a separate window
+- Embedded llama.cpp WebUI in-app via iframe (GUI) or via llama-cli (TUI)
+- Pop-out to a separate window (GUI)
 
-**First-Launch Wizard**
+**First-Launch Wizard (GUI)**
 - Hardware detection and runtime recommendation
 - Model selection with hardware fit indicators
 - Get from zero to chatting in under a minute
@@ -74,6 +80,48 @@ npm run dev
 
 # Production build (outputs to src-tauri/target/release/bundle/)
 npm run build
+
+# Run TUI (terminal interface)
+npm run tui
+# Or directly with cargo:
+cargo run --manifest-path src-tauri/Cargo.toml --bin catapult-tui
+```
+
+## TUI Usage
+
+The TUI provides the same functionality as the GUI in a terminal-friendly format.
+
+### Navigation
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Navigate between fields/sections |
+| `1-6` | Switch tabs (Dashboard, Runtime, Models, Server, Logs, Chat) |
+| `d`, `r`, `m`, `s`, `l`, `c` | Quick-jump to tab by first letter |
+| `↑/↓` | Navigate lists |
+| `Enter` | Select/activate |
+| `Space` | Toggle checkbox |
+| `Esc` / `q` | Go back / quit |
+| `?` | Show help |
+
+### Tabs
+
+- **Dashboard** — System overview, quick launch, runtime status
+- **Runtime** — Download and switch between llama.cpp builds
+- **Models** — Browse local models, search HuggingFace, manage downloads
+- **Server** — Configure and start the llama-server with full parameter coverage
+- **Logs** — Stream server output in real-time
+- **Chat** — Launch llama-cli for terminal-based chat (TUI resumes after exit)
+
+### Building the TUI
+
+```bash
+# Run directly
+cargo run --manifest-path src-tauri/Cargo.toml --bin catapult-tui
+
+# Build release binary
+cargo build --manifest-path src-tauri/Cargo.toml --bin catapult-tui --release
+# Binary will be at: src-tauri/target/release/catapult-tui
 ```
 
 ## Testing
@@ -96,7 +144,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation cove
 ## Tech Stack
 
 - **Backend:** Rust, Tauri v2, Tokio, Reqwest, Serde
-- **Frontend:** React, TypeScript, Vite, Tailwind CSS
+- **Frontend (GUI):** React, TypeScript, Vite, Tailwind CSS
+- **Frontend (TUI):** [ratatui](https://github.com/ratatui/ratatui), crossterm, tui-input
 - **Testing:** Vitest (frontend), `#[cfg(test)]` modules (backend)
 - **CI:** GitHub Actions — tests on every push/PR, cross-platform builds on main/tags
 
