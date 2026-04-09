@@ -42,6 +42,8 @@ pub struct ServerTabState {
     pub preset_selected: usize,
     pub preset_name_input: String,
     pub preset_action: PresetAction,
+    /// Name of the currently loaded preset (None = default / no named preset)
+    pub current_preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,8 +72,11 @@ impl ServerTabState {
             })
             .collect();
 
+        // Load __default__ preset if it exists, else use built-in defaults
+        let config = load_preset("__default__").unwrap_or_default();
+
         Self {
-            config: ServerConfig::default(),
+            config,
             autocomplete: AutocompleteState::new(items),
             focus: ServerFocus::Overrides,
             override_selected: 0,
@@ -84,6 +89,7 @@ impl ServerTabState {
             preset_selected: 0,
             preset_name_input: String::new(),
             preset_action: PresetAction::Load,
+            current_preset: None,
         }
     }
 
@@ -151,6 +157,32 @@ fn delete_preset(name: &str) -> anyhow::Result<()> {
         std::fs::remove_file(&path)?;
     }
     Ok(())
+}
+
+// ── Model-aware preset loading ───────────────────────────────────────────────
+
+/// Load the last-used preset for `model_path` (falls back to `__default__`).
+/// Preserves model_path and mmproj_path in the resulting config.
+pub fn load_preset_for_model(app: &mut crate::tui::app::TuiApp, model_path: &str) {
+    let preset_name = app.config.model_presets.get(model_path).cloned()
+        .or_else(|| if load_preset("__default__").is_ok() { Some("__default__".to_string()) } else { None });
+
+    let current_model = app.server_tab.config.model_path.clone();
+    let current_mmproj = app.server_tab.config.mmproj_path.clone();
+
+    if let Some(ref name) = preset_name {
+        if let Ok(mut cfg) = load_preset(name) {
+            cfg.model_path = current_model;
+            cfg.mmproj_path = current_mmproj;
+            app.server_tab.config = cfg;
+            app.server_tab.refresh_overrides();
+            // Only track named (non-default) presets as "current"
+            app.server_tab.current_preset = if name == "__default__" { None } else { Some(name.clone()) };
+            return;
+        }
+    }
+    // No preset found — keep existing config but reset current_preset
+    app.server_tab.current_preset = None;
 }
 
 // ── Overrides collection ─────────────────────────────────────────────────────
@@ -438,10 +470,16 @@ fn handle_preset_picker(app: &mut TuiApp, key: KeyEvent) -> Action {
                         let mmproj = app.server_tab.config.mmproj_path.clone();
                         match load_preset(&name) {
                             Ok(mut cfg) => {
-                                cfg.model_path = model_path;
+                                cfg.model_path = model_path.clone();
                                 cfg.mmproj_path = mmproj;
                                 app.server_tab.config = cfg;
                                 app.server_tab.refresh_overrides();
+                                app.server_tab.current_preset = Some(name.clone());
+                                // Remember this preset for the current model
+                                if !model_path.is_empty() {
+                                    app.config.model_presets.insert(model_path, name.clone());
+                                    let _ = app.config.save();
+                                }
                                 app.server_tab.status_message =
                                     Some(format!("Loaded preset: {}", name));
                             }
@@ -660,6 +698,14 @@ fn start_server_action(app: &mut TuiApp) {
     match server_ctl::start_server(&server_binary, &app.server_tab.config, &app.config) {
         Ok(pid) => {
             app.server_tab.status_message = Some(format!("Server started (PID {})", pid));
+            // Save model→preset association so next selection auto-loads this preset
+            if let Some(ref preset) = app.server_tab.current_preset.clone() {
+                let model_path = app.server_tab.config.model_path.clone();
+                if !model_path.is_empty() {
+                    app.config.model_presets.insert(model_path, preset.clone());
+                    let _ = app.config.save();
+                }
+            }
         }
         Err(e) => {
             app.server_tab.status_message = Some(format!("Failed to start: {}", e));

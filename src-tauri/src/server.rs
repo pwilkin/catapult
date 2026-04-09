@@ -119,6 +119,28 @@ pub fn new_server_state() -> SharedServerState {
     Arc::new(Mutex::new(ServerState::new()))
 }
 
+/// Apply `HfPresetParams` fields to an existing `ServerConfig`.
+/// Only overwrites fields that are present in the preset.
+pub fn apply_hf_preset_params(params: &crate::huggingface::HfPresetParams, config: &mut ServerConfig) {
+    if let Some(v) = params.temperature { config.temperature = v; }
+    if let Some(v) = params.top_k { config.top_k = v; }
+    if let Some(v) = params.top_p { config.top_p = v; }
+    if let Some(v) = params.min_p { config.min_p = v; }
+    if let Some(v) = params.n_predict { config.n_predict = v; }
+    if let Some(v) = params.seed { config.seed = Some(v); }
+    if let Some(v) = params.repeat_penalty {
+        config.extra_params.insert("repeat-penalty".to_string(), format!("{:.4}", v));
+    }
+    if let Some(v) = params.repeat_last_n {
+        config.extra_params.insert("repeat-last-n".to_string(), v.to_string());
+    }
+}
+
+/// Derive a safe preset name from a HuggingFace repo_id (e.g. "unsloth/Foo" → "unsloth__Foo").
+pub fn preset_name_from_repo(repo_id: &str) -> String {
+    repo_id.replace('/', "__")
+}
+
 pub async fn start_server(
     server_binary: &PathBuf,
     config: &ServerConfig,
@@ -574,5 +596,87 @@ mod tests {
         };
         let args = build_args(&config);
         assert!(!args.contains(&"--threads".to_string()));
+    }
+
+    // ── apply_hf_preset_params ───────────────────────────────────────────────
+
+    fn make_hf_params() -> crate::huggingface::HfPresetParams {
+        crate::huggingface::HfPresetParams {
+            temperature: Some(0.6),
+            top_k: Some(30),
+            top_p: Some(0.85),
+            min_p: Some(0.02),
+            n_predict: Some(1024),
+            seed: Some(123),
+            repeat_penalty: Some(1.15),
+            repeat_last_n: Some(64),
+        }
+    }
+
+    #[test]
+    fn apply_hf_preset_updates_sampling_fields() {
+        let mut cfg = ServerConfig::default();
+        apply_hf_preset_params(&make_hf_params(), &mut cfg);
+
+        assert!((cfg.temperature - 0.6).abs() < 1e-5);
+        assert_eq!(cfg.top_k, 30);
+        assert!((cfg.top_p - 0.85).abs() < 1e-5);
+        assert!((cfg.min_p - 0.02).abs() < 1e-5);
+        assert_eq!(cfg.n_predict, 1024);
+        assert_eq!(cfg.seed, Some(123));
+    }
+
+    #[test]
+    fn apply_hf_preset_puts_repeat_in_extra_params() {
+        let mut cfg = ServerConfig::default();
+        apply_hf_preset_params(&make_hf_params(), &mut cfg);
+
+        assert!(cfg.extra_params.contains_key("repeat-penalty"),
+            "repeat_penalty should be stored in extra_params");
+        assert!(cfg.extra_params.contains_key("repeat-last-n"),
+            "repeat_last_n should be stored in extra_params");
+        let rp: f32 = cfg.extra_params["repeat-penalty"].parse().unwrap();
+        assert!((rp - 1.15).abs() < 1e-3);
+        assert_eq!(cfg.extra_params["repeat-last-n"], "64");
+    }
+
+    #[test]
+    fn apply_hf_preset_none_fields_preserve_defaults() {
+        let mut cfg = ServerConfig::default();
+        let default_temp = cfg.temperature;
+        let params = crate::huggingface::HfPresetParams::default(); // all None
+        apply_hf_preset_params(&params, &mut cfg);
+
+        // Nothing should have changed
+        assert!((cfg.temperature - default_temp).abs() < 1e-5);
+        assert!(cfg.extra_params.is_empty());
+        assert_eq!(cfg.seed, None);
+    }
+
+    #[test]
+    fn apply_hf_preset_does_not_touch_hardware_fields() {
+        let mut cfg = ServerConfig {
+            n_gpu_layers: 99,
+            n_ctx: 4096,
+            n_threads: Some(8),
+            ..Default::default()
+        };
+        apply_hf_preset_params(&make_hf_params(), &mut cfg);
+        // Hardware fields must be untouched
+        assert_eq!(cfg.n_gpu_layers, 99);
+        assert_eq!(cfg.n_ctx, 4096);
+        assert_eq!(cfg.n_threads, Some(8));
+    }
+
+    // ── preset_name_from_repo ────────────────────────────────────────────────
+
+    #[test]
+    fn preset_name_from_repo_replaces_slash() {
+        assert_eq!(preset_name_from_repo("unsloth/Qwen3.5-4B-GGUF"), "unsloth__Qwen3.5-4B-GGUF");
+    }
+
+    #[test]
+    fn preset_name_from_repo_no_slash() {
+        assert_eq!(preset_name_from_repo("plain-name"), "plain-name");
     }
 }

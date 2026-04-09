@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ── Runtime management types ─────────────────────────────────────────────────
@@ -71,6 +72,9 @@ pub struct AppConfig {
     pub selected_model: Option<String>,
     #[serde(default)]
     pub wizard_completed: bool,
+    /// Maps model file path → last-used preset name for that model
+    #[serde(default)]
+    pub model_presets: HashMap<String, String>,
 }
 
 impl AppConfig {
@@ -245,5 +249,37 @@ impl AppConfig {
 
     pub fn is_managed_runtime(&self) -> bool {
         matches!(self.active_runtime, ActiveRuntime::Managed { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_presets_defaults_empty() {
+        let cfg = AppConfig::default();
+        assert!(cfg.model_presets.is_empty());
+    }
+
+    #[test]
+    fn model_presets_round_trips_through_json() {
+        let mut cfg = AppConfig::default();
+        cfg.model_presets.insert("/home/user/models/foo.gguf".to_string(), "mypreset".to_string());
+        cfg.model_presets.insert("/home/user/models/bar.gguf".to_string(), "another".to_string());
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.model_presets.get("/home/user/models/foo.gguf").map(|s| s.as_str()), Some("mypreset"));
+        assert_eq!(restored.model_presets.get("/home/user/models/bar.gguf").map(|s| s.as_str()), Some("another"));
+    }
+
+    #[test]
+    fn model_presets_missing_from_json_defaults_to_empty() {
+        // Old config.json without the model_presets key should deserialize cleanly
+        let json = r#"{"auto_check_updates":false,"wizard_completed":true,"favorite_models":[]}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.model_presets.is_empty());
     }
 }

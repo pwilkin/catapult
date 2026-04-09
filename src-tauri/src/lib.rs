@@ -308,6 +308,23 @@ async fn download_model(
 
     state.downloads.lock().unwrap().remove(&filename);
 
+    // On success, check for presets.ini in the repo and save as a named preset
+    if result.is_ok() {
+        if let Ok(Some(params)) = huggingface::fetch_presets_ini(&state.http_client, &repo_id).await {
+            if !params.is_empty() {
+                let preset_name = server::preset_name_from_repo(&repo_id);
+                if let Ok(dir) = AppConfig::presets_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut cfg = server::ServerConfig::default();
+                    server::apply_hf_preset_params(&params, &mut cfg);
+                    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                        let _ = std::fs::write(dir.join(format!("{}.json", preset_name)), json);
+                    }
+                }
+            }
+        }
+    }
+
     result
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| e.to_string())
@@ -566,6 +583,19 @@ async fn delete_server_preset(name: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn get_model_preset(model_path: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let config = state.config.lock().unwrap();
+    Ok(config.model_presets.get(&model_path).cloned())
+}
+
+#[tauri::command]
+async fn set_model_preset(model_path: String, preset_name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.model_presets.insert(model_path, preset_name);
+    config.save().map_err(|e| e.to_string())
+}
+
 // ── Tauri app setup ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -641,6 +671,9 @@ pub fn run() {
             save_server_preset,
             load_server_preset,
             delete_server_preset,
+            // Per-model preset memory
+            get_model_preset,
+            set_model_preset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

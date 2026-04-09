@@ -215,11 +215,17 @@ fn handle_installed(app: &mut TuiApp, key: KeyEvent) -> Action {
         KeyCode::Enter => {
             let filtered = app.models_tab.filtered_models();
             if let Some(&(_, model)) = filtered.get(app.models_tab.selected) {
-                app.server_tab.config.model_path = model.path.display().to_string();
-                if let Some(ref mmproj) = model.mmproj_path {
-                    app.server_tab.config.mmproj_path = Some(mmproj.display().to_string());
-                }
-                app.server_tab.status_message = Some(format!("Model selected: {}", model.name));
+                let model_path = model.path.display().to_string();
+                let model_name = model.name.clone();
+                app.server_tab.config.model_path = model_path.clone();
+                app.server_tab.config.mmproj_path = model
+                    .mmproj_path
+                    .as_ref()
+                    .map(|p| p.display().to_string());
+                // Load last-used (or default) preset for this model
+                super::server::load_preset_for_model(app, &model_path);
+                app.server_tab.status_message = Some(format!("Model selected: {}", model_name));
+                app.active_tab = Tab::Server;
             }
         }
         KeyCode::Char('/') => {
@@ -600,6 +606,25 @@ fn start_file_download(app: &mut TuiApp, repo_id: &str, file: &HfFile) {
             },
         )
         .await;
+
+        // On successful download, check for presets.ini and save as a named preset
+        if result.is_ok() {
+            if let Ok(Some(params)) =
+                catapult_lib::huggingface::fetch_presets_ini(&client, &repo_id).await
+            {
+                if !params.is_empty() {
+                    let preset_name = catapult_lib::server::preset_name_from_repo(&repo_id);
+                    if let Ok(dir) = catapult_lib::config::AppConfig::presets_dir() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let mut cfg = catapult_lib::server::ServerConfig::default();
+                        catapult_lib::server::apply_hf_preset_params(&params, &mut cfg);
+                        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                            let _ = std::fs::write(dir.join(format!("{}.json", preset_name)), json);
+                        }
+                    }
+                }
+            }
+        }
 
         let (status, percent) = match &result {
             Ok(_) => ("complete".to_string(), 100.0),

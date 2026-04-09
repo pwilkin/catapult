@@ -312,7 +312,7 @@ export default function Server() {
     } catch (e) { setError(String(e)); }
   };
 
-  const loadPreset = async (name: string) => {
+  const loadPreset = async (name: string, modelPath?: string) => {
     try {
       const loaded = await invoke<ServerConfig>("load_server_preset", { name });
       // Preserve current model_path and mmproj_path
@@ -323,6 +323,11 @@ export default function Server() {
       }));
       setActivePreset(name);
       setShowPresetMenu(false);
+      // Save model→preset association (use provided path or fall back to current config)
+      const pathToSave = modelPath ?? config.model_path;
+      if (pathToSave) {
+        await invoke("set_model_preset", { modelPath: pathToSave, presetName: name }).catch(() => {});
+      }
     } catch (e) { setError(String(e)); }
   };
 
@@ -388,7 +393,9 @@ export default function Server() {
     const [mdls, srv, cfg] = await Promise.all([
       invoke<ModelInfo[]>("list_installed_models").catch(() => []),
       invoke<ServerStatus>("get_server_status").catch(() => ({ type: "stopped" as const })),
-      invoke<{ favorite_models: string[]; selected_model: string | null }>("get_config").catch(() => ({ favorite_models: [], selected_model: null })),
+      invoke<{ favorite_models: string[]; selected_model: string | null; model_presets: Record<string, string> }>(
+        "get_config"
+      ).catch(() => ({ favorite_models: [] as string[], selected_model: null, model_presets: {} as Record<string, string> })),
     ]);
     setFavorites(cfg.favorite_models);
     setModels(mdls);
@@ -404,6 +411,13 @@ export default function Server() {
         model_path: pick.path,
         mmproj_path: pick.is_vision && pick.mmproj_path ? pick.mmproj_path : null,
       }));
+      // Auto-load the last-used preset for this model (on first visit only)
+      if (!loadSessionConfig()) {
+        const savedPreset = cfg.model_presets[pick.path];
+        if (savedPreset) {
+          await loadPreset(savedPreset, pick.path);
+        }
+      }
     }
   };
 
@@ -448,19 +462,34 @@ export default function Server() {
     } catch {}
   };
 
-  const handleModelChange = (m: ModelInfo) => {
+  const handleModelChange = async (m: ModelInfo) => {
     setConfig((c) => ({
       ...c,
       model_path: m.path,
       mmproj_path: m.is_vision && m.mmproj_path ? m.mmproj_path : null,
     }));
-    applyModelConfig(m.path);
+    // Check if there's a saved preset for this model; if so, use it
+    try {
+      const savedPreset = await invoke<string | null>("get_model_preset", { modelPath: m.path });
+      if (savedPreset) {
+        await loadPreset(savedPreset, m.path);
+        return;
+      }
+    } catch {}
+    // No model-specific preset — apply hardware suggestions
+    await applyModelConfig(m.path);
   };
 
   const startServer = async () => {
     if (!config.model_path) { setError("Please select a model."); return; }
     setError(null); setLogs([]); setShowLogs(true);
-    try { await invoke("start_server", { config }); }
+    try {
+      await invoke("start_server", { config });
+      // Persist the model→preset association so next visit auto-loads it
+      if (activePreset && config.model_path) {
+        await invoke("set_model_preset", { modelPath: config.model_path, presetName: activePreset }).catch(() => {});
+      }
+    }
     catch (e) { setError(String(e)); }
   };
 

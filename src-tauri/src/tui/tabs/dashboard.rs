@@ -39,14 +39,15 @@ pub fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Action {
         KeyCode::Enter => {
             // Select model and jump to server tab
             if let Some(model) = app.dashboard.models.get(app.dashboard.selected_model) {
-                app.server_tab.config.model_path = model.path.display().to_string();
-                if let Some(ref mmproj) = model.mmproj_path {
-                    app.server_tab.config.mmproj_path = Some(mmproj.display().to_string());
-                }
-                // If server not running, jump to server tab to launch
-                if app.server.is_none() {
-                    app.active_tab = Tab::Server;
-                }
+                let model_path = model.path.display().to_string();
+                app.server_tab.config.model_path = model_path.clone();
+                app.server_tab.config.mmproj_path = model
+                    .mmproj_path
+                    .as_ref()
+                    .map(|p| p.display().to_string());
+                // Load last-used (or default) preset for this model
+                super::server::load_preset_for_model(app, &model_path);
+                app.active_tab = Tab::Server;
             }
         }
         KeyCode::Char('f') => {

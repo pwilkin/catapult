@@ -457,6 +457,99 @@ fn urlencoding_simple(s: &str) -> String {
         .collect()
 }
 
+// ── presets.ini support ───────────────────────────────────────────────────────
+
+/// Sampling parameters parsed from a HuggingFace repo's `presets.ini`.
+/// Fields are `None` when not present in the file.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct HfPresetParams {
+    pub temperature: Option<f32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub n_predict: Option<i32>,
+    pub seed: Option<u64>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<i32>,
+}
+
+impl HfPresetParams {
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_k.is_none()
+            && self.top_p.is_none()
+            && self.min_p.is_none()
+            && self.n_predict.is_none()
+            && self.seed.is_none()
+            && self.repeat_penalty.is_none()
+            && self.repeat_last_n.is_none()
+    }
+}
+
+/// Fetch and parse `presets.ini` from a HuggingFace repo.
+/// Returns `Ok(None)` if the file doesn't exist.
+pub async fn fetch_presets_ini(
+    client: &reqwest::Client,
+    repo_id: &str,
+) -> Result<Option<HfPresetParams>> {
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/presets.ini",
+        repo_id
+    );
+    let resp = client.get(&url).send().await?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let text = resp.text().await?;
+    Ok(Some(parse_presets_ini(&text)))
+}
+
+fn parse_presets_ini(content: &str) -> HfPresetParams {
+    let mut params = HfPresetParams::default();
+    for line in content.lines() {
+        let line = line.trim();
+        // Skip comments and section headers
+        if line.starts_with('#') || line.starts_with(';') || line.starts_with('[') || line.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim().to_lowercase();
+            let val = val.trim();
+            match key.as_str() {
+                "temperature" | "temp" => {
+                    params.temperature = val.parse().ok();
+                }
+                "top_k" | "top-k" => {
+                    params.top_k = val.parse().ok();
+                }
+                "top_p" | "top-p" => {
+                    params.top_p = val.parse().ok();
+                }
+                "min_p" | "min-p" => {
+                    params.min_p = val.parse().ok();
+                }
+                "n_predict" | "max_new_tokens" | "max_tokens" | "max-new-tokens" => {
+                    params.n_predict = val.parse().ok();
+                }
+                "seed" => {
+                    params.seed = val.parse().ok();
+                }
+                "repeat_penalty" | "repeat-penalty" | "repetition_penalty" => {
+                    params.repeat_penalty = val.parse().ok();
+                }
+                "repeat_last_n" | "repeat-last-n" => {
+                    params.repeat_last_n = val.parse().ok();
+                }
+                _ => {}
+            }
+        }
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +679,86 @@ mod tests {
         // Subdirectory should be stripped from filenames
         assert!(!split.filename.contains('/'));
         assert!(!split.split_parts[0].filename.contains('/'));
+    }
+
+    // ── presets.ini parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn presets_ini_basic_fields() {
+        let ini = "temperature = 0.7\ntop_k = 50\ntop_p = 0.9\nmin_p = 0.02\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.temperature, Some(0.7));
+        assert_eq!(p.top_k, Some(50));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.min_p, Some(0.02));
+    }
+
+    #[test]
+    fn presets_ini_aliases() {
+        // temp → temperature, top-k → top_k, max_new_tokens → n_predict
+        let ini = "temp = 0.6\ntop-k = 30\ntop-p = 0.85\nmin-p = 0.01\nmax_new_tokens = 512\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.temperature, Some(0.6));
+        assert_eq!(p.top_k, Some(30));
+        assert_eq!(p.top_p, Some(0.85));
+        assert_eq!(p.min_p, Some(0.01));
+        assert_eq!(p.n_predict, Some(512));
+    }
+
+    #[test]
+    fn presets_ini_repeat_and_seed() {
+        let ini = "repeat_penalty = 1.1\nrepeat_last_n = 64\nseed = 42\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.repeat_penalty, Some(1.1));
+        assert_eq!(p.repeat_last_n, Some(64));
+        assert_eq!(p.seed, Some(42));
+    }
+
+    #[test]
+    fn presets_ini_skips_comments_and_sections() {
+        let ini = "# This is a comment\n[sampling]\ntemperature = 0.8\n; another comment\ntop_k = 40\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.temperature, Some(0.8));
+        assert_eq!(p.top_k, Some(40));
+        assert_eq!(p.top_p, None);
+    }
+
+    #[test]
+    fn presets_ini_empty_is_empty() {
+        let p = parse_presets_ini("");
+        assert!(p.is_empty());
+        let p2 = parse_presets_ini("# just a comment\n[section]\n");
+        assert!(p2.is_empty());
+    }
+
+    #[test]
+    fn presets_ini_not_empty_when_field_set() {
+        let mut p = HfPresetParams::default();
+        assert!(p.is_empty());
+        p.temperature = Some(0.5);
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn presets_ini_unknown_keys_ignored() {
+        let ini = "temperature = 0.7\nsome_unknown_key = 99\nchat_template = llama3\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.temperature, Some(0.7));
+        // Everything else remains None
+        assert_eq!(p.top_k, None);
+    }
+
+    #[test]
+    fn presets_ini_repetition_penalty_alias() {
+        let ini = "repetition_penalty = 1.15\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.repeat_penalty, Some(1.15));
+    }
+
+    #[test]
+    fn presets_ini_max_tokens_alias() {
+        let ini = "max_tokens = 256\n";
+        let p = parse_presets_ini(ini);
+        assert_eq!(p.n_predict, Some(256));
     }
 }

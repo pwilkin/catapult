@@ -207,4 +207,6 @@ export interface AppConfig {
   favorite_models: string[];
   selected_model: string | null;
   wizard_completed: boolean;
+  /** Maps model file path → last-used preset name */
+  model_presets: Record<string, string>;
 }
