@@ -4,7 +4,9 @@ A desktop launcher for [llama.cpp](https://github.com/ggml-org/llama.cpp). Manag
 
 Available in two interfaces:
 - **GUI** — A Tauri v2 desktop application (Rust backend + React/TypeScript frontend)
+<img width="1280" height="808" alt="catapult-ui" src="https://github.com/user-attachments/assets/a39fa2ae-d289-4bdd-a335-2d083666956c" />
 - **TUI** — A terminal-based interface built with [ratatui](https://github.com/ratatui/ratatui) for those who prefer the command line
+<img width="1212" height="684" alt="catapult-tui" src="https://github.com/user-attachments/assets/368ac91d-fe48-474c-8eca-ed46e5d79c6e" />
 
 ## Features
 
