@@ -324,6 +324,7 @@ fn get_nvidia_vram_mb() -> Option<u64> {
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 fn detect_backends(gpus: &[GpuInfo]) -> Vec<BackendInfo> {
     let mut backends = vec![BackendInfo {
         id: "cpu".to_string(),

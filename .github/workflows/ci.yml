@@ -91,6 +91,17 @@ jobs:
 
       - run: npm ci
 
+      - name: Build catapult-tui universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin --bin catapult-tui --manifest-path src-tauri/Cargo.toml
+          cargo build --release --target x86_64-apple-darwin --bin catapult-tui --manifest-path src-tauri/Cargo.toml
+          mkdir -p src-tauri/target/universal-apple-darwin/release
+          lipo -create \
+            src-tauri/target/aarch64-apple-darwin/release/catapult-tui \
+            src-tauri/target/x86_64-apple-darwin/release/catapult-tui \
+            -output src-tauri/target/universal-apple-darwin/release/catapult-tui
+
       - name: Build
         uses: tauri-apps/tauri-action@v0
         env:
