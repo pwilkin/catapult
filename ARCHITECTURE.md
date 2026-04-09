@@ -17,7 +17,7 @@ catapult/
 │   ├── runtime.rs           # GitHub release fetching, asset scoring, download/extraction
 │   ├── models.rs            # GGUF scanning, metadata parsing, model download with resume
 │   ├── server.rs            # ServerConfig, process spawn/kill, CLI arg builder
-│   ├── huggingface.rs       # HF API search, recommended models, quant extraction
+│   ├── huggingface.rs       # HF API search, recommended models, quant extraction, presets.ini fetch
 │   ├── main.rs              # GUI entry point stub
 │   ├── tui_main.rs          # TUI entry point (ratatui + crossterm)
 │   └── tui/                 # TUI implementation (~2,200 LOC)
@@ -58,7 +58,7 @@ catapult/
 
 ## IPC pattern (GUI only)
 
-All filesystem, network, and process operations live in Rust. The frontend calls `invoke()` for request/response and `listen()` for streaming events. There are 47 registered Tauri commands spanning hardware detection, runtime management, model operations, server control, configuration, and presets.
+All filesystem, network, and process operations live in Rust. The frontend calls `invoke()` for request/response and `listen()` for streaming events. There are 49 registered Tauri commands spanning hardware detection, runtime management, model operations, server control, configuration, presets, and per-model preset memory.
 
 **Events:**
 - `download_progress` (DownloadProgress) — streamed during runtime and model downloads
@@ -191,6 +191,8 @@ Models tagged as vision-capable are paired with compatible mmproj files found in
 ### ServerConfig
 Core typed fields: model path, mmproj path, host, port, context size, GPU layers, threads, flash attention mode, KV cache types, sampling parameters (temperature, top-k/p, min-p, seed), batch sizes, memory flags (mlock, mmap), RoPE parameters, parallel slots.
 
+The Advanced tab (GUI) and TUI params cover an extended set of parameters including: MoE CPU offloading (`cpu-moe`, `n-cpu-moe`), weight repacking (`no-repack`), host tensor offload (`no-op-offload`), device bypass (`no-host`), memory auto-fitting (`--fit`, `--fit-margin`, `--fit-ctx`), KV unified buffer (`kv-unified`), N-gram speculation (`spec-ngram-size-n/m`, `spec-ngram-min-hits`), lookup cache files, draft model threading/device params, built-in tools (`tools`), embedding/classification separators, WebUI config overrides, and `reuse-port`.
+
 All additional llama-server parameters are stored in `extra_params: HashMap<String, String>` where:
 - Keys are CLI flag names without `--` prefix (e.g. "api-key", "timeout")
 - Empty values represent boolean flags (emitted as just `--flag`)
@@ -204,8 +206,14 @@ Parameters are organized into 6 tabs: Context, Hardware, Sampling, Server, Chat,
 ### TUI Forms
 Parameters are edited via inline text inputs within tab panels. Navigation uses Tab/Shift+Tab to move between fields. Checkboxes are toggled with Space. The Server tab provides fields for the most common parameters; advanced parameters can be added via the `extra_params` HashMap editor.
 
+The TUI Server tab tracks the `current_preset` name (`Option<String>`). On model selection, `load_preset_for_model()` looks up the model's saved preset from `AppConfig.model_presets`, falling back to `__default__`. When a server is started, the active preset is persisted to `model_presets`.
+
 ### Presets
 Server configurations are saved as JSON files in `{data_dir}/catapult/presets/`. A special `__default__` preset stores user-customized defaults. Model path and mmproj path are excluded from presets (they're per-session). Loading a preset preserves the current model selection.
+
+**Per-model preset memory**: Each model can have a last-used preset associated with it. This association is stored in `AppConfig.model_presets` (`HashMap<String, String>`, keyed by model file path). When a model is selected, its saved preset is auto-loaded. When a preset is applied and a server is started, the model→preset association is persisted. Two new Tauri commands support this: `get_model_preset` and `set_model_preset`.
+
+**HuggingFace `presets.ini` auto-import**: On successful model download, Catapult fetches `presets.ini` from the HF repo (if it exists) and saves it as a named preset (repo ID with `/` replaced by `__`). The file is parsed for sampling parameters: temperature, top-k/p, min-p, n-predict, seed, repeat-penalty, repeat-last-n. This is handled by `huggingface::fetch_presets_ini()` and `server::apply_hf_preset_params()`.
 
 ### Session persistence (GUI only)
 Server configuration, active preset, and active tab are persisted to `sessionStorage` across page navigation within the same session. On initial load, state is restored from sessionStorage with fallback to saved defaults.
@@ -214,13 +222,13 @@ The TUI does not persist session state; each launch starts fresh with the Dashbo
 
 ### Model selection (GUI)
 - The model list in the Run page is collapsible (shows selected model name when collapsed)
-- Models are sorted with favorites first
-- Selecting a model auto-applies suggested hardware settings (n_ctx, n_gpu_layers) without overriding user preferences
+- Models are sorted with favorites first; vision models display an eye icon
+- Selecting a model checks for a saved preset (`get_model_preset`); if found, the preset is loaded instead of hardware suggestions. Otherwise, auto-applies suggested hardware settings (n_ctx, n_gpu_layers) without overriding user preferences
 
 ### Model selection (TUI)
 - Models are selected via arrow navigation in a scrollable list
-- Favorites are shown first with a `★` marker
-- Selecting a model updates the server config immediately
+- Favorites are shown first with a `★` marker; vision models are flagged with a `V` marker (cyan)
+- Selecting a model updates the server config immediately and auto-loads the model's last-used preset via `load_preset_for_model()`
 - No auto-collapse; the list remains visible for re-selection
 
 ## Server process management
@@ -269,6 +277,6 @@ The TUI Chat tab launches `llama-cli` as an interactive subprocess with the curr
 
 ## Testing
 
-- **Rust:** `cargo test` — unit tests in `#[cfg(test)]` modules covering asset scoring, backend detection, CLI arg building, quant extraction, size estimation, filename parsing, GGUF parsing, hardware config suggestions, split file parsing, imatrix detection, and split model consolidation. TUI modules share the same core logic and are tested through the underlying library functions.
-- **TypeScript:** `npm test` (Vitest) — utility function tests for CPU/GPU name shortening, size formatting, quant color/sort mapping, imatrix detection, and MXFP quant handling
+- **Rust:** `cargo test` — 55 unit tests in `#[cfg(test)]` modules covering asset scoring, backend detection, CLI arg building, quant extraction, size estimation, filename parsing, GGUF parsing, hardware config suggestions, split file parsing, imatrix detection, split model consolidation, `presets.ini` parsing, `apply_hf_preset_params`, preset name derivation, and `AppConfig.model_presets` round-tripping. TUI modules share the same core logic and are tested through the underlying library functions.
+- **TypeScript:** `npm test` (Vitest) — 34 utility function tests for CPU/GPU name shortening, size formatting, quant color/sort mapping, imatrix detection, and MXFP quant handling
 - Tests caught a real bug: `noavx` backend detection was unreachable due to `contains("avx")` matching first

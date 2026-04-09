@@ -24,11 +24,12 @@ Available in two interfaces:
 - Download models from HuggingFace with resume support and exponential backoff retry
 - Curated list of recommended models filtered by your hardware
 - Favorites, sorting, filtering, and quant-level color coding
-- Vision model detection with automatic mmproj file pairing
+- Vision model detection with automatic mmproj file pairing; vision models marked in the dashboard (eye icon in GUI, `V` marker in TUI)
 
 **Server Configuration**
 - Full llama.cpp server parameter coverage organized into tabbed UI (Context, Hardware, Sampling, Server, Chat, Advanced)
-- Save and load named configuration presets
+- Save and load named configuration presets; per-model preset memory (last-used preset auto-loads on model selection)
+- Auto-import `presets.ini` from HuggingFace repos on model download (sampling parameters applied as a named preset)
 - Process lifecycle management with log streaming
 - One-click launch from the dashboard
 
