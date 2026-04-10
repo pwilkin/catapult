@@ -157,7 +157,8 @@ export default function Models() {
 
   const startDownload = async (
     repoId: string,
-    file: HfFile
+    file: HfFile,
+    companionModel?: string
   ) => {
     // Clear any paused state for this file
     setDownloads((prev) => {
@@ -171,6 +172,7 @@ export default function Models() {
         downloadUrl: file.download_url,
         sizeBytes: file.size_bytes,
         splitParts: file.is_split && file.split_parts.length > 0 ? file.split_parts : null,
+        companionModel: companionModel ?? null,
       });
     } catch (e) {
       // Error is expected when retries exhausted — paused status is already set via event
@@ -196,7 +198,7 @@ export default function Models() {
     setMmProjPicker(null);
     startDownload(repoId, file);
     if (mmProjFile) {
-      startDownload(repoId, mmProjFile);
+      startDownload(repoId, mmProjFile, file.filename);
     }
   };
 

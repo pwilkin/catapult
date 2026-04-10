@@ -140,6 +140,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npx tsc --noEmit
 ```
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a list of notable changes between releases.
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical documentation covering the IPC pattern, data directories, runtime/model/server subsystems, and more.

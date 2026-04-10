@@ -13,7 +13,7 @@ pub enum TuiEvent {
     HfSearchResults(Result<Vec<HfModel>, String>),
     HfRepoFiles(String, Result<Vec<catapult_lib::huggingface::HfFile>, String>),
     RuntimeRelease(Result<catapult_lib::runtime::ReleaseInfo, String>),
-    RuntimeDownloaded(catapult_lib::config::AppConfig),
+    RuntimeDownloaded(catapult_lib::runtime::DownloadedRuntime),
     ServerStopped,
 }
 

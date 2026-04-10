@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -21,6 +22,7 @@ import type {
   AssetOption,
   BackendInfo,
   CustomBuild,
+  ScanResult,
   DownloadProgress,
   AppConfig,
 } from "../types";
@@ -44,6 +46,9 @@ export default function Runtime() {
   const [showAll, setShowAll] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [customBuilds, setCustomBuilds] = useState<CustomBuild[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<DownloadProgress | null>(null);
 
   const loadData = async () => {
     try {
@@ -102,22 +107,68 @@ export default function Runtime() {
     setProgress(null);
   };
 
+  const startUpdate = async () => {
+    // Use already-fetched release info; pick the best asset
+    let rel = release;
+    if (!rel) {
+      try {
+        rel = await invoke<ReleaseInfo>("check_latest_release");
+        setRelease(rel);
+      } catch (e) {
+        setError(String(e));
+        return;
+      }
+    }
+    const asset = rel.available_assets[0]?.name;
+    if (!asset) {
+      setError("No compatible assets found for this platform");
+      return;
+    }
+    setUpdating(true);
+    setError(null);
+    setUpdateProgress({ id: "runtime", bytes_downloaded: 0, total_bytes: 0, percent: 0, status: "downloading" });
+    const unlisten = await listen<DownloadProgress>("download_progress", (e) => {
+      setUpdateProgress(e.payload);
+    });
+    try {
+      await invoke("download_runtime", { assetName: asset });
+      await loadData();
+      setUpdateProgress(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      unlisten();
+      setUpdating(false);
+    }
+  };
+
   const browseCustom = async () => {
     const selected = await open({ directory: true, title: "Select llama.cpp directory" });
     if (!selected) return;
+    flushSync(() => { setScanning(true); setError(null); });
     try {
-      const builds = await invoke<CustomBuild[]>("scan_custom_runtime", { path: selected });
-      if (builds.length === 0) {
+      const result = await invoke<ScanResult>("scan_custom_runtime", { path: selected });
+      if (result.builds.length === 0) {
         setCustomBuilds(null);
-      } else if (builds.length === 1) {
-        await invoke("set_custom_runtime_binary", { binaryPath: builds[0].binary_path });
+        setError("No llama-server binary found in the selected directory.");
+      } else if (result.is_source_distribution) {
+        // llama.cpp source tree: add all builds as custom runtimes
+        await invoke("add_all_custom_runtime_binaries", {
+          builds: result.builds,
+        });
+        setCustomBuilds(null);
+        await loadData();
+      } else if (result.builds.length === 1) {
+        await invoke("set_custom_runtime_binary", { binaryPath: result.builds[0].binary_path });
         setCustomBuilds(null);
         await loadData();
       } else {
-        setCustomBuilds(builds);
+        setCustomBuilds(result.builds);
       }
     } catch (e) {
       setError(String(e));
+    } finally {
+      setScanning(false);
     }
   };
 
@@ -130,9 +181,9 @@ export default function Runtime() {
     }
   };
 
-  const activateManaged = async (build: number) => {
+  const activateManaged = async (build: number, backendId: string) => {
     try {
-      await invoke("set_active_runtime", { runtimeType: "managed", id: build });
+      await invoke("set_active_runtime", { runtimeType: "managed", id: build, backendId });
       await loadData();
     } catch (e) {
       setError(String(e));
@@ -148,9 +199,9 @@ export default function Runtime() {
     }
   };
 
-  const deleteManaged = async (build: number) => {
+  const deleteManaged = async (build: number, backendId: string) => {
     try {
-      await invoke("delete_managed_runtime", { build });
+      await invoke("delete_managed_runtime", { build, backendId });
       await loadData();
     } catch (e) {
       setError(String(e));
@@ -182,7 +233,8 @@ export default function Runtime() {
   const managed = appConfig?.managed_runtimes ?? [];
   const custom = appConfig?.custom_runtimes ?? [];
   const activeType = appConfig?.active_runtime?.type ?? "none";
-  const activeBuild = activeType === "managed" ? (appConfig?.active_runtime as { build: number }).build : null;
+  const activeBuild = activeType === "managed" ? (appConfig?.active_runtime as { build: number; backend_id: string }).build : null;
+  const activeBackendId = activeType === "managed" ? (appConfig?.active_runtime as { build: number; backend_id: string }).backend_id : null;
   const activeCustomIdx = activeType === "custom" ? (appConfig?.active_runtime as { index: number }).index : null;
 
   const latestBuild = release?.build;
@@ -213,6 +265,15 @@ export default function Runtime() {
         </div>
       )}
 
+      {scanning && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="card flex items-center gap-3 px-6 py-4">
+            <RefreshCw size={16} className="text-primary animate-spin" />
+            <span className="text-sm text-gray-200">Searching for server runtimes…</span>
+          </div>
+        </div>
+      )}
+
       {/* ── Active Runtime ── */}
       <div className="card">
         <h2 className="section-title">Active Runtime</h2>
@@ -239,15 +300,28 @@ export default function Runtime() {
             {runtime.path && (
               <p className="text-xs text-gray-500 font-mono">{runtime.path}</p>
             )}
-            {updateAvailable && (
+            {updateAvailable && !updating && (
               <div className="flex items-center gap-2 mt-2 px-3 py-2 border border-accent-yellow/30 bg-accent-yellow/5">
                 <Package size={13} className="text-accent-yellow" />
                 <span className="text-xs text-accent-yellow">
                   Update available: <span className="font-mono">b{latestBuild}</span>
                 </span>
-                <button className="btn-primary text-xs ml-auto" onClick={() => setShowReleases(true)}>
+                <button className="btn-primary text-xs ml-auto" onClick={startUpdate}>
                   <Download size={12} /> Update
                 </button>
+              </div>
+            )}
+            {updating && (
+              <div className="mt-2 px-3 py-2 border border-primary/30 bg-primary/5">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-gray-300">
+                    {updateProgress?.status === "extracting" ? "Extracting…" : "Updating…"}
+                  </span>
+                  <span className="text-xs font-mono text-gray-400">{(updateProgress?.percent ?? 0).toFixed(1)}%</span>
+                </div>
+                <div className="progress-bar">
+                  <div className="progress-fill" style={{ width: `${updateProgress?.percent ?? 0}%` }} />
+                </div>
               </div>
             )}
           </div>
@@ -315,9 +389,9 @@ export default function Runtime() {
             {/* Current managed runtimes */}
             <div className="space-y-1.5">
               {currentMr.map((r) => {
-                const isActive = r.build === activeBuild;
+                const isActive = r.build === activeBuild && r.backend_id === activeBackendId;
                 return (
-                  <div key={r.build}
+                  <div key={`${r.build}-${r.backend_id}`}
                     className={`flex items-center gap-3 px-3 py-2.5 border ${
                       isActive ? "border-primary/40 bg-primary/5" : "border-border"
                     }`}>
@@ -332,11 +406,11 @@ export default function Runtime() {
                           {new Date(r.installed_at * 1000).toLocaleDateString()}
                         </span>
                         <button className="btn-ghost text-xs py-0.5 px-1.5"
-                          onClick={() => activateManaged(r.build)} title="Activate">
+                          onClick={() => activateManaged(r.build, r.backend_id)} title="Activate">
                           <Play size={11} />
                         </button>
                         <button className="text-gray-600 hover:text-accent-red"
-                          onClick={() => deleteManaged(r.build)} title="Delete">
+                          onClick={() => deleteManaged(r.build, r.backend_id)} title="Delete">
                           <Trash2 size={12} />
                         </button>
                       </>
@@ -358,7 +432,7 @@ export default function Runtime() {
                 {showArchived && (
                   <div className="space-y-1.5 mt-2">
                     {archivedMr.map((r) => (
-                      <div key={r.build}
+                      <div key={`${r.build}-${r.backend_id}`}
                         className="flex items-center gap-3 px-3 py-2 border border-border">
                         <span className="text-sm font-mono text-gray-400">b{r.build}</span>
                         <span className="text-xs text-gray-500 uppercase">{r.backend_label}</span>
@@ -366,11 +440,11 @@ export default function Runtime() {
                           {new Date(r.installed_at * 1000).toLocaleDateString()}
                         </span>
                         <button className="btn-ghost text-xs py-0.5 px-1.5"
-                          onClick={() => activateManaged(r.build)} title="Activate">
+                          onClick={() => activateManaged(r.build, r.backend_id)} title="Activate">
                           <Play size={11} />
                         </button>
                         <button className="text-gray-600 hover:text-accent-red"
-                          onClick={() => deleteManaged(r.build)} title="Delete">
+                          onClick={() => deleteManaged(r.build, r.backend_id)} title="Delete">
                           <Trash2 size={12} />
                         </button>
                       </div>

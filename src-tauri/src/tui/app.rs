@@ -432,13 +432,13 @@ impl TuiApp {
 
     fn runtime_label(&self) -> String {
         match &self.config.active_runtime {
-            catapult_lib::config::ActiveRuntime::Managed { build } => {
-                if let Some(rt) = self
-                    .config
-                    .managed_runtimes
-                    .iter()
-                    .find(|r| r.build == *build)
-                {
+            catapult_lib::config::ActiveRuntime::Managed { build, backend_id } => {
+                let rt = if backend_id.is_empty() {
+                    self.config.managed_runtimes.iter().find(|r| r.build == *build)
+                } else {
+                    self.config.managed_runtimes.iter().find(|r| r.build == *build && r.backend_id == *backend_id)
+                };
+                if let Some(rt) = rt {
                     format!("b{} {}", rt.build, rt.backend_label)
                 } else {
                     format!("b{}", build)

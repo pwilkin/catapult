@@ -178,6 +178,9 @@ struct GgufCacheEntry {
     meta_context_length: Option<u64>,
     #[serde(default)]
     is_vision: bool,
+    /// True if GGUF architecture is "clip" or filename contains "mmproj"
+    #[serde(default)]
+    is_mmproj: bool,
 }
 
 type GgufCache = HashMap<String, GgufCacheEntry>;
@@ -344,6 +347,7 @@ fn scan_gguf_recursive(
                         size_label: cached.meta_size_label.clone(),
                         context_length: cached.meta_context_length,
                         is_vision: cached.is_vision,
+                        is_mmproj: cached.is_mmproj || huggingface::is_mmproj_file(&filename),
                     }
                 } else {
                     *cache_dirty = true;
@@ -354,6 +358,11 @@ fn scan_gguf_recursive(
                 read_and_cache(&path, size_bytes, mtime_secs, &cache_key, cache)
             };
 
+            // Skip mmproj files from the main model listing
+            if cached_meta.is_mmproj {
+                continue;
+            }
+
             let name = cached_meta.name
                 .map(|n| n.rsplit('/').next().unwrap_or(&n).to_string())
                 .filter(|n| n.len() >= 4) // Ignore suspiciously short GGUF names
@@ -363,7 +372,7 @@ fn scan_gguf_recursive(
 
             // Find compatible mmproj for vision models
             let mmproj_path = if cached_meta.is_vision {
-                find_mmproj(&path, &filename)
+                find_mmproj(&path, &filename, cache)
             } else {
                 None
             };
@@ -389,9 +398,10 @@ fn scan_gguf_recursive(
 }
 
 /// Find a compatible mmproj file in the same directory as the model.
-/// The mmproj must contain "mmproj" and share a reasonable common substring
-/// (model name + param count) with the main model.
-fn find_mmproj(model_path: &Path, model_filename: &str) -> Option<PathBuf> {
+/// Detects mmproj files by filename ("mmproj" substring) or GGUF metadata
+/// (architecture == "clip"). Requires the mmproj to share name segments with
+/// the main model.
+fn find_mmproj(model_path: &Path, model_filename: &str, cache: &GgufCache) -> Option<PathBuf> {
     let dir = model_path.parent()?;
     let stem = model_filename.trim_end_matches(".gguf");
 
@@ -415,12 +425,17 @@ fn find_mmproj(model_path: &Path, model_filename: &str) -> Option<PathBuf> {
         if !path.is_file() { continue; }
         let fname = path.file_name()?.to_string_lossy().to_string();
         let fname_lower = fname.to_lowercase();
-
-        // Must contain "mmproj" and be a .gguf file
-        if !fname_lower.contains("mmproj") { continue; }
         if !fname_lower.ends_with(".gguf") { continue; }
         // Must not be the model itself
         if fname == model_filename { continue; }
+
+        // Check if this file is an mmproj: by filename OR by cached GGUF metadata
+        let is_mmproj_by_name = fname_lower.contains("mmproj");
+        let cache_key = path.to_string_lossy().to_string();
+        let is_mmproj_by_cache = cache.get(&cache_key).map_or(false, |e| e.is_mmproj);
+        if !is_mmproj_by_name && !is_mmproj_by_cache {
+            continue;
+        }
 
         // Count how many base segments appear in the mmproj filename
         let matches = segments.iter()
@@ -443,6 +458,7 @@ struct CachedMeta {
     size_label: Option<String>,
     context_length: Option<u64>,
     is_vision: bool,
+    is_mmproj: bool,
 }
 
 fn is_vision_model(tags: &[String]) -> bool {
@@ -450,6 +466,11 @@ fn is_vision_model(tags: &[String]) -> bool {
         let lower = t.to_lowercase();
         lower == "image-to-text" || lower == "image-text-to-text"
     })
+}
+
+/// Detect mmproj from GGUF metadata: architecture == "clip"
+fn is_mmproj_by_metadata(meta: &GgufMeta) -> bool {
+    meta.architecture.as_deref().map(|a| a.to_lowercase()) == Some("clip".to_string())
 }
 
 fn read_and_cache(
@@ -461,6 +482,8 @@ fn read_and_cache(
 ) -> CachedMeta {
     let meta = read_gguf_metadata(path).unwrap_or_default();
     let is_vision = is_vision_model(&meta.tags);
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let is_mmproj = is_mmproj_by_metadata(&meta) || huggingface::is_mmproj_file(&filename);
     cache.insert(
         cache_key.to_string(),
         GgufCacheEntry {
@@ -470,6 +493,7 @@ fn read_and_cache(
             meta_size_label: meta.size_label.clone(),
             meta_context_length: meta.context_length,
             is_vision,
+            is_mmproj,
         },
     );
     CachedMeta {
@@ -477,6 +501,7 @@ fn read_and_cache(
         size_label: meta.size_label,
         context_length: meta.context_length,
         is_vision,
+        is_mmproj,
     }
 }
 
@@ -524,6 +549,25 @@ pub async fn download_model(
     }
 
     download_single_file(client, &file.filename, &file.download_url, file.size_bytes, &models_dir, &progress_cb).await
+}
+
+/// Compute a prefixed filename for an mmproj when downloaded alongside a model.
+/// E.g. model "Qwen2.5-VL-7B-Q4_K_M.gguf" + mmproj "mmproj-f16.gguf"
+///   → "Qwen2.5-VL-7B-mmproj-f16.gguf"
+pub fn prefixed_mmproj_filename(model_filename: &str, mmproj_filename: &str) -> String {
+    let model_stem = model_filename.trim_end_matches(".gguf");
+    // Strip trailing quant pattern to get the model base name
+    let re = regex::Regex::new(r"[-_](?:MXFP\d|IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
+    let base = re.replace(model_stem, "").to_string();
+
+    // If the mmproj filename already contains the model base name, return as-is
+    let mmproj_lower = mmproj_filename.to_lowercase();
+    let base_lower = base.to_lowercase();
+    if mmproj_lower.contains(&base_lower) {
+        return mmproj_filename.to_string();
+    }
+
+    format!("{}-{}", base, mmproj_filename)
 }
 
 /// Download all parts of a split GGUF model, reporting combined progress.
@@ -965,5 +1009,78 @@ mod tests {
                     "should have context_length for {}", path_str);
             }
         }
+    }
+
+    // ── mmproj filename prefixing tests ──
+
+    #[test]
+    fn prefixed_mmproj_adds_model_base_when_missing() {
+        let result = prefixed_mmproj_filename(
+            "Qwen2.5-VL-7B-Q4_K_M.gguf",
+            "mmproj-model-f16.gguf",
+        );
+        assert_eq!(result, "Qwen2.5-VL-7B-mmproj-model-f16.gguf");
+    }
+
+    #[test]
+    fn prefixed_mmproj_preserves_name_when_already_present() {
+        let result = prefixed_mmproj_filename(
+            "Qwen2.5-VL-7B-Q4_K_M.gguf",
+            "Qwen2.5-VL-7B-mmproj-f16.gguf",
+        );
+        assert_eq!(result, "Qwen2.5-VL-7B-mmproj-f16.gguf");
+    }
+
+    #[test]
+    fn prefixed_mmproj_case_insensitive_match() {
+        let result = prefixed_mmproj_filename(
+            "GLM-4.6V-Flash-Q4_K_M.gguf",
+            "glm-4.6v-flash-mmproj-f16.gguf",
+        );
+        assert_eq!(result, "glm-4.6v-flash-mmproj-f16.gguf");
+    }
+
+    #[test]
+    fn prefixed_mmproj_different_quant_formats() {
+        let result = prefixed_mmproj_filename(
+            "Llama-3.2-11B-Vision-F16.gguf",
+            "mmproj-f16.gguf",
+        );
+        assert_eq!(result, "Llama-3.2-11B-Vision-mmproj-f16.gguf");
+    }
+
+    // ── mmproj metadata detection tests ──
+
+    #[test]
+    fn is_mmproj_by_metadata_clip_architecture() {
+        let meta = GgufMeta {
+            architecture: Some("clip".to_string()),
+            ..Default::default()
+        };
+        assert!(is_mmproj_by_metadata(&meta));
+    }
+
+    #[test]
+    fn is_mmproj_by_metadata_non_clip() {
+        let meta = GgufMeta {
+            architecture: Some("llama".to_string()),
+            ..Default::default()
+        };
+        assert!(!is_mmproj_by_metadata(&meta));
+    }
+
+    #[test]
+    fn is_mmproj_by_metadata_case_insensitive() {
+        let meta = GgufMeta {
+            architecture: Some("CLIP".to_string()),
+            ..Default::default()
+        };
+        assert!(is_mmproj_by_metadata(&meta));
+    }
+
+    #[test]
+    fn is_mmproj_by_metadata_none_architecture() {
+        let meta = GgufMeta::default();
+        assert!(!is_mmproj_by_metadata(&meta));
     }
 }

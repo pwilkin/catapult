@@ -85,9 +85,11 @@ pub fn handle_key(app: &mut TuiApp, key: KeyEvent) -> Action {
             // Activate selected runtime
             let managed_count = app.config.managed_runtimes.len();
             if app.runtime_tab.selected < managed_count {
-                let build = app.config.managed_runtimes[app.runtime_tab.selected].build;
+                let rt = &app.config.managed_runtimes[app.runtime_tab.selected];
+                let build = rt.build;
+                let backend_id = rt.backend_id.clone();
                 app.config.active_runtime =
-                    catapult_lib::config::ActiveRuntime::Managed { build };
+                    catapult_lib::config::ActiveRuntime::Managed { build, backend_id };
                 let _ = app.config.save();
                 app.dashboard.loaded = false;
                 app.chat_tab.checked = false;
@@ -171,7 +173,6 @@ fn start_runtime_download(app: &mut TuiApp, asset: &AssetOption, tag_name: &str)
     let client = app.http_client.clone();
     let asset = asset.clone();
     let tag_name = tag_name.to_string();
-    let mut config = app.config.clone();
     let tx = app.event_tx.clone();
     let dl_id2 = dl_id.clone();
     let total_bytes = asset.size_mb * 1024 * 1024;
@@ -184,7 +185,6 @@ fn start_runtime_download(app: &mut TuiApp, asset: &AssetOption, tag_name: &str)
             &client,
             &asset,
             &tag_name,
-            &mut config,
             move |mut progress| {
                 let mut last = last_send.lock().unwrap();
                 let now = std::time::Instant::now();
@@ -199,13 +199,13 @@ fn start_runtime_download(app: &mut TuiApp, asset: &AssetOption, tag_name: &str)
         .await;
 
         let (status, percent) = match &result {
-            Ok(_) => ("complete".to_string(), 100.0),
+            Ok(_downloaded) => ("complete".to_string(), 100.0),
             Err(e) => (format!("error: {}", e), 0.0),
         };
 
-        // Send updated config back on success
-        if result.is_ok() {
-            let _ = tx.send(TuiEvent::RuntimeDownloaded(config));
+        // Send downloaded runtime info back on success
+        if let Ok(downloaded) = result {
+            let _ = tx.send(TuiEvent::RuntimeDownloaded(downloaded));
         }
 
         let _ = tx.send(TuiEvent::DownloadProgress(
@@ -263,8 +263,13 @@ fn render_active_runtime(app: &TuiApp, area: Rect, frame: &mut Frame) {
     ))];
 
     match &app.config.active_runtime {
-        catapult_lib::config::ActiveRuntime::Managed { build } => {
-            if let Some(rt) = app.config.managed_runtimes.iter().find(|r| r.build == *build) {
+        catapult_lib::config::ActiveRuntime::Managed { build, backend_id } => {
+            let rt = if backend_id.is_empty() {
+                app.config.managed_runtimes.iter().find(|r| r.build == *build)
+            } else {
+                app.config.managed_runtimes.iter().find(|r| r.build == *build && r.backend_id == *backend_id)
+            };
+            if let Some(rt) = rt {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled("Managed", Style::default().fg(Color::Green)),
@@ -314,7 +319,7 @@ fn render_runtime_lists(app: &TuiApp, area: Rect, frame: &mut Frame) {
         for rt in &app.config.managed_runtimes {
             let is_active = matches!(
                 &app.config.active_runtime,
-                catapult_lib::config::ActiveRuntime::Managed { build } if *build == rt.build
+                catapult_lib::config::ActiveRuntime::Managed { build, backend_id } if *build == rt.build && (backend_id.is_empty() || *backend_id == rt.backend_id)
             );
             let is_selected = idx == app.runtime_tab.selected;
             let marker = if is_selected { " > " } else { "   " };

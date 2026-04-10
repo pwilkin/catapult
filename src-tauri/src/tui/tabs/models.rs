@@ -352,7 +352,7 @@ fn handle_search(app: &mut TuiApp, key: KeyEvent) -> Action {
                 if picker.selected > 0 {
                     let mmproj = &picker.mmproj_files[picker.selected - 1];
                     if !app.downloads.contains_key(&mmproj.filename) {
-                        start_file_download(app, &repo_id, mmproj);
+                        start_file_download_with_companion(app, &repo_id, mmproj, Some(&file.filename));
                     }
                 }
             }
@@ -640,6 +640,10 @@ fn handle_directories(app: &mut TuiApp, key: KeyEvent) -> Action {
 // ── Download ─────────────────────────────────────────────────────────────────
 
 fn start_file_download(app: &mut TuiApp, repo_id: &str, file: &HfFile) {
+    start_file_download_with_companion(app, repo_id, file, None);
+}
+
+fn start_file_download_with_companion(app: &mut TuiApp, repo_id: &str, file: &HfFile, companion_model: Option<&str>) {
     let filename = file.filename.clone();
 
     // Check if already downloading
@@ -647,9 +651,16 @@ fn start_file_download(app: &mut TuiApp, repo_id: &str, file: &HfFile) {
         return;
     }
 
+    // If downloading an mmproj with a companion model, prefix the filename
+    let mut file_clone = file.clone();
+    if file.is_mmproj {
+        if let Some(model_name) = companion_model {
+            file_clone.filename = catapult_lib::models::prefixed_mmproj_filename(model_name, &file.filename);
+        }
+    }
+
     let client = app.http_client.clone();
     let repo_id = repo_id.to_string();
-    let file_clone = file.clone();
     let size_bytes = file.size_bytes;
     let config = app.config.clone();
     let tx = app.event_tx.clone();

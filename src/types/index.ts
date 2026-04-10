@@ -82,6 +82,11 @@ export interface CustomBuild {
   label: string;
 }
 
+export interface ScanResult {
+  builds: CustomBuild[];
+  is_source_distribution: boolean;
+}
+
 // ── Models ────────────────────────────────────────────────────────────────────
 
 export interface ModelInfo {
@@ -197,7 +202,7 @@ export interface DownloadProgress {
 export interface AppConfig {
   managed_runtimes: ManagedRuntimeInfo[];
   custom_runtimes: CustomRuntimeInfo[];
-  active_runtime: { type: "managed"; build: number } | { type: "custom"; index: number } | { type: "none" };
+  active_runtime: { type: "managed"; build: number; backend_id: string } | { type: "custom"; index: number } | { type: "none" };
   auto_delete_old_runtimes: boolean;
   models_dir: string | null;
   model_dirs: string[];

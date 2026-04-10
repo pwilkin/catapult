@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -11,6 +12,7 @@ import {
   Download,
   CheckCircle,
   FolderOpen,
+  RefreshCw,
   ChevronRight,
   ChevronLeft,
 } from "lucide-react";
@@ -23,6 +25,7 @@ import type {
   RecommendedModel,
   DownloadProgress,
   CustomBuild,
+  ScanResult,
 } from "../types";
 
 function mbToGb(mb: number): string {
@@ -87,6 +90,7 @@ export default function Wizard() {
   const [runtimeProgress, setRuntimeProgress] = useState<DownloadProgress | null>(null);
   const [runtimeDone, setRuntimeDone] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [scanning, setScanning] = useState(false);
   const [customBuilds, setCustomBuilds] = useState<CustomBuild[] | null>(null);
 
   // Step 2 state
@@ -186,25 +190,34 @@ export default function Wizard() {
       title: "Select llama.cpp directory",
     });
     if (!selected) return;
+    flushSync(() => { setScanning(true); setRuntimeError(null); });
     try {
-      const builds = await invoke<CustomBuild[]>("scan_custom_runtime", {
+      const result = await invoke<ScanResult>("scan_custom_runtime", {
         path: selected,
       });
-      if (builds.length === 0) {
-        // No binaries found — try set_custom_runtime as fallback
+      if (result.builds.length === 0) {
         setRuntimeError("No llama-server binary found in the selected directory.");
-      } else if (builds.length === 1) {
+      } else if (result.is_source_distribution) {
+        await invoke("add_all_custom_runtime_binaries", {
+          builds: result.builds,
+        });
+        const rt = await invoke<RuntimeInfo>("get_runtime_info");
+        setRuntime(rt);
+        setRuntimeDone(true);
+      } else if (result.builds.length === 1) {
         await invoke("set_custom_runtime_binary", {
-          binaryPath: builds[0].binary_path,
+          binaryPath: result.builds[0].binary_path,
         });
         const rt = await invoke<RuntimeInfo>("get_runtime_info");
         setRuntime(rt);
         setRuntimeDone(true);
       } else {
-        setCustomBuilds(builds);
+        setCustomBuilds(result.builds);
       }
     } catch (e) {
       setRuntimeError(String(e));
+    } finally {
+      setScanning(false);
     }
   };
 
@@ -338,6 +351,15 @@ export default function Wizard() {
                 or point to an existing installation.
               </p>
             </div>
+
+            {scanning && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+                <div className="card flex items-center gap-3 px-6 py-4">
+                  <RefreshCw size={16} className="text-primary animate-spin" />
+                  <span className="text-sm text-gray-200">Searching for server runtimes…</span>
+                </div>
+              </div>
+            )}
 
             {runtimeError && (
               <div className="card border-accent-red/30 bg-accent-red/5">

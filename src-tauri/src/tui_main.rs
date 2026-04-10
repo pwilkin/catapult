@@ -107,9 +107,9 @@ async fn main() -> anyhow::Result<()> {
             Some(TuiEvent::ServerStopped) => {
                 tui::tabs::server::on_server_stopped(&mut app);
             }
-            Some(TuiEvent::RuntimeDownloaded(config)) => {
-                // Apply config from the download task (has new runtime registered)
-                app.config = config;
+            Some(TuiEvent::RuntimeDownloaded(downloaded)) => {
+                // Register the downloaded runtime into the live config
+                let _ = catapult_lib::runtime::register_downloaded_runtime(&mut app.config, downloaded);
                 let _ = app.config.save();
                 app.dashboard.loaded = false;
                 app.chat_tab.checked = false;

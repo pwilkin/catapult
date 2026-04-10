@@ -9,7 +9,7 @@ use config::AppConfig;
 use hardware::{suggest_config, BackendInfo, SystemInfo};
 use huggingface::{HfFile, HfFilePart, HfModel, KNOWN_GGUF_OWNERS};
 use models::{ModelInfo, RecommendedModel};
-use runtime::{CustomBuild, ReleaseInfo, RuntimeInfo};
+use runtime::{ReleaseInfo, RuntimeInfo};
 use server::{ServerConfig, ServerStatus, SharedServerState};
 
 use std::collections::HashMap;
@@ -89,7 +89,6 @@ async fn download_runtime(
         .ok_or_else(|| format!("Asset '{}' not found in release", asset_name))?;
 
     let tag_name = release.tag_name.clone();
-    let mut config = state.config.lock().unwrap().clone();
 
     state.downloads.lock().unwrap().insert("runtime".to_string(), false);
 
@@ -97,7 +96,6 @@ async fn download_runtime(
         &state.http_client,
         &asset,
         &tag_name,
-        &mut config,
         move |progress| {
             let _ = app.emit("download_progress", &progress);
         },
@@ -107,9 +105,12 @@ async fn download_runtime(
     state.downloads.lock().unwrap().remove("runtime");
 
     match result {
-        Ok(()) => {
-            *state.config.lock().unwrap() = config;
-            Ok(())
+        Ok(downloaded) => {
+            // Apply to the live config under the lock — no stale clone can erase changes
+            let mut config = state.config.lock().unwrap();
+            runtime::register_downloaded_runtime(&mut config, downloaded)
+                .map_err(|e| e.to_string())?;
+            config.save().map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
     }
@@ -118,22 +119,48 @@ async fn download_runtime(
 #[tauri::command]
 async fn set_custom_runtime(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let path = std::path::PathBuf::from(path);
-    let mut config = state.config.lock().unwrap().clone();
+    let mut config = state.config.lock().unwrap();
     runtime::set_custom_runtime(&path, &mut config).map_err(|e| e.to_string())?;
-    *state.config.lock().unwrap() = config;
-    Ok(())
+    config.save().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn scan_custom_runtime(path: String) -> Result<Vec<CustomBuild>, String> {
+async fn scan_custom_runtime(path: String) -> Result<runtime::ScanResult, String> {
     let path = std::path::PathBuf::from(path);
     runtime::scan_for_builds(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
+async fn add_all_custom_runtime_binaries(
+    builds: Vec<runtime::CustomBuild>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    let mut first_new_index = None;
+    for build in builds {
+        let binary_path = build.binary_path;
+        if config.custom_runtimes.iter().any(|c| c.binary_path == binary_path) {
+            continue;
+        }
+        let index = config.custom_runtimes.len();
+        if first_new_index.is_none() {
+            first_new_index = Some(index);
+        }
+        config.custom_runtimes.push(config::CustomRuntime {
+            label: build.label,
+            binary_path,
+        });
+    }
+    if let Some(idx) = first_new_index {
+        config.active_runtime = config::ActiveRuntime::Custom { index: idx };
+    }
+    config.save().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn set_custom_runtime_binary(binary_path: String, state: State<'_, AppState>) -> Result<(), String> {
     let binary_path = std::path::PathBuf::from(binary_path);
-    let mut config = state.config.lock().unwrap().clone();
+    let mut config = state.config.lock().unwrap();
     // Add to custom runtimes list and activate
     let label = binary_path.parent()
         .and_then(|p| p.file_name())
@@ -150,25 +177,30 @@ async fn set_custom_runtime_binary(binary_path: String, state: State<'_, AppStat
         });
         config.active_runtime = config::ActiveRuntime::Custom { index };
     }
-    config.save().map_err(|e| e.to_string())?;
-    *state.config.lock().unwrap() = config;
-    Ok(())
+    config.save().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn set_active_runtime(
     runtime_type: String,
     id: usize,
+    backend_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
     config.active_runtime = match runtime_type.as_str() {
         "managed" => {
             let build = id as u32;
-            if !config.managed_runtimes.iter().any(|r| r.build == build) {
-                return Err(format!("Managed runtime b{} not found", build));
+            let bid = backend_id.unwrap_or_default();
+            let found = if bid.is_empty() {
+                config.managed_runtimes.iter().any(|r| r.build == build)
+            } else {
+                config.managed_runtimes.iter().any(|r| r.build == build && r.backend_id == bid)
+            };
+            if !found {
+                return Err(format!("Managed runtime b{} ({}) not found", build, bid));
             }
-            config::ActiveRuntime::Managed { build }
+            config::ActiveRuntime::Managed { build, backend_id: bid }
         }
         "custom" => {
             if id >= config.custom_runtimes.len() {
@@ -182,11 +214,10 @@ async fn set_active_runtime(
 }
 
 #[tauri::command]
-async fn delete_managed_runtime(build: u32, state: State<'_, AppState>) -> Result<(), String> {
-    let mut config = state.config.lock().unwrap().clone();
-    runtime::delete_managed_runtime(build, &mut config).map_err(|e| e.to_string())?;
-    *state.config.lock().unwrap() = config;
-    Ok(())
+async fn delete_managed_runtime(build: u32, backend_id: Option<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    runtime::delete_managed_runtime(build, &backend_id.unwrap_or_default(), &mut config).map_err(|e| e.to_string())?;
+    config.save().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -306,6 +337,7 @@ async fn download_model(
     download_url: String,
     size_bytes: u64,
     split_parts: Option<Vec<HfFilePart>>,
+    companion_model: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let config = state.config.lock().unwrap().clone();
@@ -315,14 +347,26 @@ async fn download_model(
         _ => (false, vec![]),
     };
 
+    // If downloading an mmproj alongside a model, prefix the filename
+    let is_mmproj = huggingface::is_mmproj_file(&filename);
+    let save_filename = if is_mmproj {
+        if let Some(ref model_name) = companion_model {
+            models::prefixed_mmproj_filename(model_name, &filename)
+        } else {
+            filename.clone()
+        }
+    } else {
+        filename.clone()
+    };
+
     let file = HfFile {
-        filename: filename.clone(),
+        filename: save_filename.clone(),
         size_bytes,
         quant: huggingface::extract_quant(&filename),
         download_url,
         is_split,
         split_parts: parts,
-        is_mmproj: false,
+        is_mmproj,
     };
 
     // Mark download active
@@ -633,7 +677,21 @@ async fn set_model_preset(model_path: String, preset_name: String, state: State<
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut config = AppConfig::load().unwrap_or_default();
+    let mut config = match AppConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: failed to load config: {e}");
+            // Back up the existing config file so the user can recover it
+            if let Ok(path) = AppConfig::config_path() {
+                if path.exists() {
+                    let backup = path.with_extension("json.bak");
+                    eprintln!("Backing up config to {}", backup.display());
+                    let _ = std::fs::copy(&path, &backup);
+                }
+            }
+            AppConfig::default()
+        }
+    };
 
     // --force-wizard resets the wizard flag so it runs again
     if std::env::args().any(|a| a == "--force-wizard" || a == "-w") {
@@ -668,6 +726,7 @@ pub fn run() {
             set_custom_runtime,
             scan_custom_runtime,
             set_custom_runtime_binary,
+            add_all_custom_runtime_binaries,
             set_active_runtime,
             delete_managed_runtime,
             remove_custom_runtime,

@@ -26,11 +26,17 @@ pub struct CustomRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ActiveRuntime {
-    Managed { build: u32 },
+    Managed {
+        build: u32,
+        #[serde(default)]
+        backend_id: String,
+    },
     Custom { index: usize },
     #[default]
     None,
 }
+
+fn default_true() -> bool { true }
 
 // ── App config ───────────────────────────────────────────────────────────────
 
@@ -64,6 +70,7 @@ pub struct AppConfig {
     // ── Updates ──
     pub last_update_check: Option<i64>,
     pub latest_known_build: Option<u32>,
+    #[serde(default = "default_true")]
     pub auto_check_updates: bool,
 
     // ── Preferences ──
@@ -126,7 +133,7 @@ impl AppConfig {
                         dir_name,
                         installed_at: 0,
                     });
-                    config.active_runtime = ActiveRuntime::Managed { build };
+                    config.active_runtime = ActiveRuntime::Managed { build, backend_id: config.runtime_backend.clone().unwrap_or_default() };
                 }
             }
             config.runtime_dir = None;
@@ -205,8 +212,14 @@ impl AppConfig {
     /// Returns the directory of the active runtime (for find_server_binary).
     pub fn runtime_dir(&self) -> Result<PathBuf> {
         match &self.active_runtime {
-            ActiveRuntime::Managed { build } => {
-                if let Some(mr) = self.managed_runtimes.iter().find(|r| r.build == *build) {
+            ActiveRuntime::Managed { build, backend_id } => {
+                // Match on both build and backend_id; fall back to build-only for legacy configs
+                let mr = if backend_id.is_empty() {
+                    self.managed_runtimes.iter().find(|r| r.build == *build)
+                } else {
+                    self.managed_runtimes.iter().find(|r| r.build == *build && r.backend_id == *backend_id)
+                };
+                if let Some(mr) = mr {
                     // Check both new runtimes/ dir and legacy runtime/ dir
                     let new_dir = Self::runtimes_base_dir()?.join(&mr.dir_name);
                     if new_dir.exists() {
@@ -245,7 +258,14 @@ impl AppConfig {
 
     pub fn active_build(&self) -> Option<u32> {
         match &self.active_runtime {
-            ActiveRuntime::Managed { build } => Some(*build),
+            ActiveRuntime::Managed { build, .. } => Some(*build),
+            _ => None,
+        }
+    }
+
+    pub fn active_backend_id(&self) -> Option<&str> {
+        match &self.active_runtime {
+            ActiveRuntime::Managed { backend_id, .. } => Some(backend_id.as_str()),
             _ => None,
         }
     }
@@ -340,5 +360,180 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.preferred_owners = vec!["myorg".to_string(), "another".to_string()];
         assert_eq!(cfg.effective_owners(), vec!["myorg", "another"]);
+    }
+
+    // ── Config round-trip integrity tests ──
+    //
+    // These ensure that serialize → deserialize preserves every user-facing
+    // field. A regression here (e.g. accidental skip_serializing) would cause
+    // config erasure on the next app restart.
+
+    /// Build a config with every field set to a distinguishable non-default
+    /// value so we can detect if any field silently disappears.
+    fn fully_populated_config() -> AppConfig {
+        AppConfig {
+            // Legacy fields are skip_serializing — intentionally omitted.
+            managed_runtimes: vec![ManagedRuntime {
+                build: 8000,
+                tag_name: "b8000".to_string(),
+                backend_id: "cuda".to_string(),
+                backend_label: "CUDA 12.4".to_string(),
+                asset_name: "llama-b8000-cuda.zip".to_string(),
+                dir_name: "b8000-cuda".to_string(),
+                installed_at: 1700000000,
+            }],
+            custom_runtimes: vec![CustomRuntime {
+                label: "my-build".to_string(),
+                binary_path: PathBuf::from("/opt/llama/llama-server"),
+            }],
+            active_runtime: ActiveRuntime::Managed {
+                build: 8000,
+                backend_id: "cuda".to_string(),
+            },
+            auto_delete_old_runtimes: true,
+            model_dirs: vec![
+                PathBuf::from("/data/models"),
+                PathBuf::from("/extra/models"),
+            ],
+            download_dir: Some(PathBuf::from("/data/models")),
+            last_update_check: Some(1700000000),
+            latest_known_build: Some(9000),
+            auto_check_updates: false, // non-default (default is true)
+            favorite_models: vec![
+                "model-alpha".to_string(),
+                "model-beta".to_string(),
+                "model-gamma".to_string(),
+            ],
+            selected_model: Some("/data/models/foo.gguf".to_string()),
+            wizard_completed: true,
+            model_presets: {
+                let mut m = HashMap::new();
+                m.insert("/data/models/foo.gguf".to_string(), "fast".to_string());
+                m.insert("/data/models/bar.gguf".to_string(), "quality".to_string());
+                m
+            },
+            preferred_owners: vec!["bartowski".to_string(), "unsloth".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// Serialize → deserialize must preserve every non-legacy field.
+    /// If a new field is added to AppConfig without #[serde(default)] or with
+    /// accidental skip_serializing, this test will catch it.
+    #[test]
+    fn config_round_trip_preserves_all_fields() {
+        let original = fully_populated_config();
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+
+        // ── Runtime fields ──
+        assert_eq!(restored.managed_runtimes.len(), 1);
+        assert_eq!(restored.managed_runtimes[0].build, 8000);
+        assert_eq!(restored.managed_runtimes[0].backend_id, "cuda");
+        assert_eq!(restored.managed_runtimes[0].backend_label, "CUDA 12.4");
+        assert_eq!(restored.managed_runtimes[0].asset_name, "llama-b8000-cuda.zip");
+        assert_eq!(restored.managed_runtimes[0].dir_name, "b8000-cuda");
+        assert_eq!(restored.managed_runtimes[0].installed_at, 1700000000);
+
+        assert_eq!(restored.custom_runtimes.len(), 1);
+        assert_eq!(restored.custom_runtimes[0].label, "my-build");
+        assert_eq!(restored.custom_runtimes[0].binary_path, PathBuf::from("/opt/llama/llama-server"));
+
+        assert_eq!(restored.active_runtime, ActiveRuntime::Managed {
+            build: 8000,
+            backend_id: "cuda".to_string(),
+        });
+        assert!(restored.auto_delete_old_runtimes);
+
+        // ── Model fields ──
+        assert_eq!(restored.model_dirs, vec![
+            PathBuf::from("/data/models"),
+            PathBuf::from("/extra/models"),
+        ]);
+        assert_eq!(restored.download_dir, Some(PathBuf::from("/data/models")));
+
+        // ── Update fields ──
+        assert_eq!(restored.last_update_check, Some(1700000000));
+        assert_eq!(restored.latest_known_build, Some(9000));
+        assert!(!restored.auto_check_updates, "auto_check_updates should be false, not reset to default true");
+
+        // ── Preference fields ──
+        assert_eq!(restored.favorite_models, vec!["model-alpha", "model-beta", "model-gamma"]);
+        assert_eq!(restored.selected_model.as_deref(), Some("/data/models/foo.gguf"));
+        assert!(restored.wizard_completed);
+        assert_eq!(restored.model_presets.len(), 2);
+        assert_eq!(restored.model_presets.get("/data/models/foo.gguf").map(|s| s.as_str()), Some("fast"));
+        assert_eq!(restored.model_presets.get("/data/models/bar.gguf").map(|s| s.as_str()), Some("quality"));
+        assert_eq!(restored.preferred_owners, vec!["bartowski", "unsloth"]);
+    }
+
+    /// Legacy fields with skip_serializing must NOT appear in JSON output.
+    /// They only exist for migration on load.
+    #[test]
+    fn config_legacy_fields_not_serialized() {
+        let mut cfg = fully_populated_config();
+        cfg.runtime_dir = Some(PathBuf::from("/old/runtime"));
+        cfg.runtime_build = Some(3000);
+        cfg.runtime_backend = Some("cuda".to_string());
+        cfg.models_dir = Some(PathBuf::from("/old/models"));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("runtime_dir"), "legacy runtime_dir should not be serialized");
+        assert!(!json.contains("runtime_build"), "legacy runtime_build should not be serialized");
+        assert!(!json.contains("runtime_backend"), "legacy runtime_backend should not be serialized");
+        assert!(!json.contains("models_dir"), "legacy models_dir should not be serialized");
+    }
+
+    /// Simulates the exact scenario that caused the config erasure bug:
+    /// a "stale" config (snapshot before changes) is serialized and then
+    /// deserialized — verify that deserializing a stale snapshot cannot
+    /// silently produce an empty/default config.
+    #[test]
+    fn config_stale_snapshot_still_deserializes_correctly() {
+        let populated = fully_populated_config();
+        let snapshot_json = serde_json::to_string(&populated).unwrap();
+
+        // Simulate: "live" config gets new favorites added
+        let mut live = fully_populated_config();
+        live.favorite_models.push("model-delta".to_string());
+        live.wizard_completed = true;
+
+        // The stale snapshot is deserialized (this is what the old bug did)
+        let stale: AppConfig = serde_json::from_str(&snapshot_json).unwrap();
+
+        // The stale config should still have ALL original data —
+        // it should not be empty/default
+        assert!(stale.wizard_completed, "stale snapshot lost wizard_completed");
+        assert_eq!(stale.favorite_models.len(), 3, "stale snapshot lost favorites");
+        assert_eq!(stale.managed_runtimes.len(), 1, "stale snapshot lost runtimes");
+        assert!(!stale.auto_check_updates, "stale snapshot reset auto_check_updates to default");
+    }
+
+    /// Canary: verify that the real config file is not modified by this test
+    /// suite. If this fails, a test is accidentally calling config.save() on
+    /// a default/test AppConfig, overwriting the user's real data.
+    ///
+    /// Run this test LAST by giving it a name that sorts after all others.
+    #[test]
+    fn zzz_canary_tests_did_not_corrupt_real_config() {
+        let path = match AppConfig::config_path() {
+            Ok(p) => p,
+            Err(_) => return, // can't determine path, skip
+        };
+        if !path.exists() {
+            return; // no config file, nothing to check
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let config: AppConfig = serde_json::from_str(&content).unwrap();
+
+        // The test suite uses build numbers like 3000-5000 and installed_at=1000.
+        // If we find those exact values in the real config, a test wrote to it.
+        for rt in &config.managed_runtimes {
+            assert!(rt.installed_at != 1000 || rt.build > 6000,
+                "REAL CONFIG CORRUPTED BY TESTS: found test fixture data \
+                 (build={}, installed_at=1000) in {}. A test is calling \
+                 config.save() on a test AppConfig.",
+                rt.build, path.display());
+        }
     }
 }
