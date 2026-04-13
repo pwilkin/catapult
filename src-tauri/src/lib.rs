@@ -772,6 +772,12 @@ pub fn run() {
             get_model_preset,
             set_model_preset,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                server::kill_server_sync(&state.server);
+            }
+        });
 }

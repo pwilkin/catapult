@@ -78,10 +78,17 @@ function WindowControls() {
 
   useEffect(() => {
     appWindow.isMaximized().then(setMaximized);
+    let debounce: ReturnType<typeof setTimeout>;
     const unlisten = appWindow.onResized(() => {
-      appWindow.isMaximized().then(setMaximized);
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        appWindow.isMaximized().then(setMaximized);
+      }, 100);
     });
-    return () => { unlisten.then((f) => f()); };
+    return () => {
+      clearTimeout(debounce);
+      unlisten.then((f) => f());
+    };
   }, []);
 
   return (

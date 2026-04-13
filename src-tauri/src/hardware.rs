@@ -2,6 +2,18 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
+/// Creates a Command that won't spawn a visible console window on Windows.
+fn silent_cmd(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub cpu_name: String,
@@ -102,7 +114,7 @@ fn detect_gpus_linux() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
     // Try nvidia-smi first for NVIDIA GPUs
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
+    if let Ok(output) = silent_cmd("nvidia-smi")
         .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
         .output()
     {
@@ -124,7 +136,7 @@ fn detect_gpus_linux() -> Vec<GpuInfo> {
     }
 
     // Try rocm-smi for AMD GPUs
-    if let Ok(output) = std::process::Command::new("rocm-smi")
+    if let Ok(output) = silent_cmd("rocm-smi")
         .args(["--showmeminfo", "vram", "--json"])
         .output()
     {
@@ -151,7 +163,7 @@ fn detect_gpus_linux() -> Vec<GpuInfo> {
 
     // Fallback: parse lspci
     if gpus.is_empty() {
-        if let Ok(output) = std::process::Command::new("lspci").output() {
+        if let Ok(output) = silent_cmd("lspci").output() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let lower = line.to_lowercase();
@@ -186,13 +198,32 @@ fn detect_gpus_linux() -> Vec<GpuInfo> {
     gpus
 }
 
+/// Returns true for virtual/emulated GPU adapters that should be deprioritized.
+#[cfg(any(target_os = "windows", test))]
+fn is_virtual_gpu(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    let virtual_keywords = [
+        "microsoft basic display",
+        "microsoft hyper-v video",
+        "microsoft remote display",
+        "vmware svga",
+        "virtualbox",
+        "parallels display",
+        "qemu",
+        "red hat qxl",
+        "aspeed",
+        "virtual render",
+    ];
+    virtual_keywords.iter().any(|kw| lower.contains(kw))
+}
+
 #[cfg(target_os = "windows")]
 fn detect_gpus_windows() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
     // Use PowerShell to query WMI
     let script = "Get-WmiObject Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json";
-    if let Ok(output) = std::process::Command::new("powershell")
+    if let Ok(output) = silent_cmd("powershell")
         .args(["-NoProfile", "-Command", script])
         .output()
     {
@@ -240,6 +271,12 @@ fn detect_gpus_windows() -> Vec<GpuInfo> {
         }
     }
 
+    // Filter out virtual GPUs when real ones are present
+    let has_real_gpu = gpus.iter().any(|g| !is_virtual_gpu(&g.name));
+    if has_real_gpu {
+        gpus.retain(|g| !is_virtual_gpu(&g.name));
+    }
+
     gpus
 }
 
@@ -247,7 +284,7 @@ fn detect_gpus_windows() -> Vec<GpuInfo> {
 fn detect_gpus_macos() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
-    if let Ok(output) = std::process::Command::new("system_profiler")
+    if let Ok(output) = silent_cmd("system_profiler")
         .args(["SPDisplaysDataType", "-json"])
         .output()
     {
@@ -311,7 +348,7 @@ fn parse_vram_string(s: &str) -> Option<u64> {
 
 #[allow(dead_code)]
 fn get_nvidia_vram_mb() -> Option<u64> {
-    let output = std::process::Command::new("nvidia-smi")
+    let output = silent_cmd("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
@@ -337,7 +374,7 @@ fn detect_backends(gpus: &[GpuInfo]) -> Vec<BackendInfo> {
     {
         // CUDA (via nvidia-smi presence)
         let cuda_available = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia)
-            && std::process::Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+            && silent_cmd("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
         backends.push(BackendInfo {
             id: "cuda".to_string(),
             name: "CUDA".to_string(),
@@ -348,7 +385,7 @@ fn detect_backends(gpus: &[GpuInfo]) -> Vec<BackendInfo> {
         // ROCm (AMD)
         let rocm_available = gpus.iter().any(|g| g.vendor == GpuVendor::Amd)
             && (std::path::Path::new("/opt/rocm").exists()
-                || std::process::Command::new("rocm-smi").output().map(|o| o.status.success()).unwrap_or(false));
+                || silent_cmd("rocm-smi").output().map(|o| o.status.success()).unwrap_or(false));
         backends.push(BackendInfo {
             id: "rocm".to_string(),
             name: "ROCm (HIP)".to_string(),
@@ -360,7 +397,7 @@ fn detect_backends(gpus: &[GpuInfo]) -> Vec<BackendInfo> {
         let vulkan_available = !gpus.is_empty()
             && (std::path::Path::new("/usr/lib/libvulkan.so.1").exists()
                 || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libvulkan.so.1").exists()
-                || std::process::Command::new("vulkaninfo").arg("--summary").output().map(|o| o.status.success()).unwrap_or(false));
+                || silent_cmd("vulkaninfo").arg("--summary").output().map(|o| o.status.success()).unwrap_or(false));
         backends.push(BackendInfo {
             id: "vulkan".to_string(),
             name: "Vulkan".to_string(),
@@ -384,7 +421,7 @@ fn detect_backends(gpus: &[GpuInfo]) -> Vec<BackendInfo> {
     {
         // CUDA
         let cuda_available = gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia)
-            && std::process::Command::new("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
+            && silent_cmd("nvidia-smi").output().map(|o| o.status.success()).unwrap_or(false);
         backends.push(BackendInfo {
             id: "cuda".to_string(),
             name: "CUDA".to_string(),
@@ -570,5 +607,88 @@ mod tests {
         let system = make_system(8192, 16384);
         let config = suggest_config(4000, &system);
         assert_eq!(config.n_ctx, 0, "should default to 0 (model default)");
+    }
+
+    // ── is_virtual_gpu ──────────────────────────────────────────────────────
+
+    #[test]
+    fn virtual_gpu_detects_hyper_v() {
+        assert!(is_virtual_gpu("Microsoft Hyper-V Video"));
+    }
+
+    #[test]
+    fn virtual_gpu_detects_basic_display() {
+        assert!(is_virtual_gpu("Microsoft Basic Display Adapter"));
+    }
+
+    #[test]
+    fn virtual_gpu_detects_vmware() {
+        assert!(is_virtual_gpu("VMware SVGA 3D"));
+    }
+
+    #[test]
+    fn virtual_gpu_detects_virtualbox() {
+        assert!(is_virtual_gpu("VirtualBox Graphics Adapter (WDDM)"));
+    }
+
+    #[test]
+    fn virtual_gpu_case_insensitive() {
+        assert!(is_virtual_gpu("MICROSOFT BASIC DISPLAY ADAPTER"));
+        assert!(is_virtual_gpu("vmware svga"));
+    }
+
+    #[test]
+    fn virtual_gpu_rejects_real_nvidia() {
+        assert!(!is_virtual_gpu("NVIDIA GeForce RTX 4090"));
+    }
+
+    #[test]
+    fn virtual_gpu_rejects_real_amd() {
+        assert!(!is_virtual_gpu("AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn virtual_gpu_rejects_real_intel() {
+        assert!(!is_virtual_gpu("Intel Arc A770"));
+    }
+
+    // ── virtual GPU filtering ───────────────────────────────────────────────
+
+    #[test]
+    fn filter_virtual_gpus_when_real_present() {
+        let mut gpus = vec![
+            GpuInfo { name: "Microsoft Hyper-V Video".into(), vram_mb: 128, vendor: GpuVendor::Unknown },
+            GpuInfo { name: "NVIDIA GeForce RTX 4090".into(), vram_mb: 24576, vendor: GpuVendor::Nvidia },
+        ];
+        let has_real = gpus.iter().any(|g| !is_virtual_gpu(&g.name));
+        if has_real {
+            gpus.retain(|g| !is_virtual_gpu(&g.name));
+        }
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 4090");
+    }
+
+    #[test]
+    fn keep_virtual_gpus_when_no_real_present() {
+        let mut gpus = vec![
+            GpuInfo { name: "Microsoft Hyper-V Video".into(), vram_mb: 128, vendor: GpuVendor::Unknown },
+            GpuInfo { name: "Microsoft Basic Display Adapter".into(), vram_mb: 0, vendor: GpuVendor::Unknown },
+        ];
+        let has_real = gpus.iter().any(|g| !is_virtual_gpu(&g.name));
+        if has_real {
+            gpus.retain(|g| !is_virtual_gpu(&g.name));
+        }
+        assert_eq!(gpus.len(), 2, "should keep all GPUs when only virtual ones exist");
+    }
+
+    // ── silent_cmd ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn silent_cmd_creates_command() {
+        // Verify silent_cmd produces a runnable Command (will fail to find
+        // the binary, but must not panic during construction).
+        let mut cmd = silent_cmd("nonexistent-binary-12345");
+        let result = cmd.output();
+        assert!(result.is_err(), "nonexistent binary should fail");
     }
 }

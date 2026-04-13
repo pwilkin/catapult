@@ -160,12 +160,17 @@ pub async fn start_server(
     let cmdline = format!("{} {}", server_binary.display(), args.join(" "));
     log::info!("Starting llama-server: {}", cmdline);
 
-    let mut child = Command::new(server_binary)
-        .args(&args)
+    let mut cmd = Command::new(server_binary);
+    cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn()
         .context("Failed to spawn llama-server")?;
 
     let pid = child.id().unwrap_or(0);
@@ -355,6 +360,49 @@ pub async fn stop_server(state: &SharedServerState) -> Result<()> {
     Ok(())
 }
 
+/// Synchronous kill for use during app exit — sends SIGTERM/TerminateProcess
+/// and waits briefly for the process to exit.
+pub fn kill_server_sync(state: &SharedServerState) {
+    let mut child = {
+        let mut s = state.lock().unwrap();
+        s.status = ServerStatus::Stopped;
+        s.process.take()
+    };
+
+    if let Some(ref mut child) = child {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            log::info!("Sent SIGTERM to server on exit (pid {})", pid);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = child.start_kill();
+        }
+
+        // Block briefly to let the process clean up
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    log::info!("Server exited on shutdown: {}", status);
+                    return;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+
+        // Force kill if still alive
+        let _ = child.start_kill();
+        let _ = child.try_wait();
+        log::warn!("Force-killed server on shutdown");
+    }
+}
+
 pub fn build_args(config: &ServerConfig) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -419,6 +467,8 @@ pub fn build_args(config: &ServerConfig) -> Vec<String> {
 
     if config.cont_batching {
         args.push("--cont-batching".to_string());
+    } else {
+        args.push("--no-cont-batching".to_string());
     }
 
     if config.mlock {
@@ -454,10 +504,8 @@ pub fn build_args(config: &ServerConfig) -> Vec<String> {
         args.push(w.to_string());
     }
 
-    if config.parallel > 1 {
-        args.push("--parallel".to_string());
-        args.push(config.parallel.to_string());
-    }
+    args.push("--parallel".to_string());
+    args.push(config.parallel.to_string());
 
     // Extra parameters from the UI
     let mut sorted_params: Vec<_> = config.extra_params.iter()
@@ -577,14 +625,66 @@ mod tests {
     }
 
     #[test]
-    fn build_args_no_parallel_when_one() {
+    fn build_args_parallel_always_emitted() {
         let config = ServerConfig {
             model_path: "/m.gguf".to_string(),
             parallel: 1,
             ..Default::default()
         };
         let args = build_args(&config);
-        assert!(!args.contains(&"--parallel".to_string()));
+        let idx = args.iter().position(|a| a == "--parallel").unwrap();
+        assert_eq!(args[idx + 1], "1");
+    }
+
+    #[test]
+    fn build_args_no_cont_batching() {
+        let config = ServerConfig {
+            model_path: "/m.gguf".to_string(),
+            cont_batching: false,
+            ..Default::default()
+        };
+        let args = build_args(&config);
+        assert!(args.contains(&"--no-cont-batching".to_string()));
+        assert!(!args.contains(&"--cont-batching".to_string()));
+    }
+
+    #[test]
+    fn build_args_parallel_emitted_for_higher_values() {
+        let config = ServerConfig {
+            model_path: "/m.gguf".to_string(),
+            parallel: 8,
+            ..Default::default()
+        };
+        let args = build_args(&config);
+        let idx = args.iter().position(|a| a == "--parallel").unwrap();
+        assert_eq!(args[idx + 1], "8");
+    }
+
+    #[test]
+    fn build_args_cont_batching_when_enabled() {
+        let config = ServerConfig {
+            model_path: "/m.gguf".to_string(),
+            cont_batching: true,
+            ..Default::default()
+        };
+        let args = build_args(&config);
+        assert!(args.contains(&"--cont-batching".to_string()));
+        assert!(!args.contains(&"--no-cont-batching".to_string()));
+    }
+
+    #[test]
+    fn build_args_default_has_parallel_and_cont_batching() {
+        // Default config: parallel=1, cont_batching=true
+        let config = ServerConfig {
+            model_path: "/m.gguf".to_string(),
+            ..Default::default()
+        };
+        let args = build_args(&config);
+        // parallel=1 must be emitted (not omitted)
+        let idx = args.iter().position(|a| a == "--parallel").unwrap();
+        assert_eq!(args[idx + 1], "1");
+        // cont_batching=true emits --cont-batching
+        assert!(args.contains(&"--cont-batching".to_string()));
     }
 
     #[test]
@@ -596,6 +696,18 @@ mod tests {
         };
         let args = build_args(&config);
         assert!(!args.contains(&"--threads".to_string()));
+    }
+
+    // ── kill_server_sync ─────────────────────────────────────────────────────
+
+    #[test]
+    fn kill_server_sync_no_process_is_noop() {
+        let state = new_server_state();
+        // Must not panic when no server is running
+        kill_server_sync(&state);
+        let s = state.lock().unwrap();
+        assert!(matches!(s.status, ServerStatus::Stopped));
+        assert!(s.process.is_none());
     }
 
     // ── apply_hf_preset_params ───────────────────────────────────────────────

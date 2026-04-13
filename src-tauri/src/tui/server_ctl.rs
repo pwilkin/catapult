@@ -307,11 +307,16 @@ pub fn start_server(
         .open(&log_path)?;
     let log_err = log_file.try_clone()?;
 
-    let child = Command::new(server_binary)
-        .args(&args)
+    let mut cmd = Command::new(server_binary);
+    cmd.args(&args)
         .stdout(log_file)
-        .stderr(log_err)
-        .spawn()?;
+        .stderr(log_err);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let child = cmd.spawn()?;
 
     let pid = child.id();
 
@@ -319,8 +324,9 @@ pub fn start_server(
     let pid_path = pid_file_path().ok_or_else(|| anyhow::anyhow!("Cannot determine data directory"))?;
     std::fs::write(&pid_path, format!("{}\n{}", pid, server_binary.display()))?;
 
-    // Detach — let the process outlive us
-    std::mem::forget(child);
+    // Drop the Child handle — std::process::Child does not kill on drop,
+    // so the server keeps running. We track it by PID file instead.
+    drop(child);
 
     Ok(pid)
 }
@@ -337,6 +343,7 @@ pub fn stop_server(pid: u32) -> anyhow::Result<()> {
     for _ in 0..60 {
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !process_alive(pid) {
+            reap_child(pid);
             cleanup_pid_file();
             return Ok(());
         }
@@ -347,8 +354,17 @@ pub fn stop_server(pid: u32) -> anyhow::Result<()> {
         libc::kill(pid as i32, libc::SIGKILL);
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
+    reap_child(pid);
     cleanup_pid_file();
     Ok(())
+}
+
+/// Reap a zombie child process so it doesn't linger in the process table.
+#[cfg(unix)]
+fn reap_child(pid: u32) {
+    unsafe {
+        libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+    }
 }
 
 #[cfg(windows)]

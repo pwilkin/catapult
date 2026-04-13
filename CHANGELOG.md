@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.2] - 2026-04-13
+
+### Fixed
+
+- **macOS app unresponsive (issue #8)**: Calling `isMaximized()` inside the window resize handler triggered an infinite resize event loop on macOS, freezing the entire UI. The check is now debounced so the loop cannot form.
+
+- **`--parallel 1` not emitted (issue #11)**: The `--parallel` flag was only emitted when the value was greater than 1. Since llama.cpp defaults to 4 parallel slots when the flag is omitted, users could not explicitly request single-slot mode from the UI. The flag is now always emitted.
+
+- **`--no-cont-batching` not emitted (issue #11)**: Disabling continuous batching in the UI had no effect — the `--no-cont-batching` flag was never passed to llama-server. It is now emitted when the toggle is off.
+
+- **Virtual GPU selected over real GPU on Windows (issue #9)**: GPU detection via WMI returned all video adapters in arbitrary order, so virtual adapters (Hyper-V, Microsoft Basic Display, VMware, etc.) could be picked as the primary GPU. Virtual adapters are now filtered out when a real GPU is present.
+
+- **Server process orphaned on GUI exit (issue #7)**: Closing the GUI window without stopping the server left llama-server running in the background with no way to reattach. A shutdown handler now terminates the server process when the app exits.
+
+- **Zombie server processes in TUI (issue #7)**: Stopped llama-server processes lingered as zombies in the process table until the TUI itself exited. The child process handle is now properly dropped instead of leaked via `mem::forget`, and `waitpid` is called after the process is confirmed dead.
+
+- **Console windows flashing on Windows (issue #10)**: Every child process spawned for hardware detection (PowerShell, nvidia-smi, etc.) opened a visible console window. All subprocess invocations now use `CREATE_NO_WINDOW` to suppress them.
+
 ## [0.1.1] - 2026-04-10
 
 ### Fixed
