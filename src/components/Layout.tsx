@@ -77,7 +77,6 @@ function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
-    appWindow.isMaximized().then(setMaximized);
     let debounce: ReturnType<typeof setTimeout>;
     const unlisten = appWindow.onResized(() => {
       clearTimeout(debounce);

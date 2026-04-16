@@ -27,6 +27,8 @@ pub fn on_tick(state: &mut LogsTabState, _config: &AppConfig) {
             state.lines = content.lines().map(|l| l.to_string()).collect();
             if state.follow {
                 state.scroll_offset = state.lines.len().saturating_sub(1);
+            } else {
+                state.scroll_offset = state.scroll_offset.min(state.lines.len().saturating_sub(1));
             }
         }
     }
@@ -158,7 +160,7 @@ pub fn render(app: &mut TuiApp, area: Rect, frame: &mut Frame) {
         frame.render_widget(empty, log_area);
     } else {
         let visible_lines = log_area.height as usize;
-        let start = app.logs_tab.scroll_offset;
+        let start = app.logs_tab.scroll_offset.min(app.logs_tab.lines.len().saturating_sub(1));
         let end = (start + visible_lines).min(app.logs_tab.lines.len());
 
         let lines: Vec<Line> = app.logs_tab.lines[start..end]

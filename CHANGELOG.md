@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3] - 2026-04-16
+
+### Fixed
+
+- **macOS app unresponsive (issue #8)**: The debounce introduced in 0.1.2 did not fully resolve the issue. The root cause was the initial `isMaximized()` call on mount, which on macOS triggers a resize event, which calls `isMaximized()` again — an infinite loop. Removed the initial call entirely; the debounced resize handler already keeps the maximize indicator in sync.
+
+- **TUI crash in logs tab (issue #13)**: After restarting the server, the new log file is shorter than the previous one. If the scroll position was beyond the end of the new log, the slice operation panicked with an out-of-range index. The scroll offset is now clamped to the new line count on every tick, with an additional guard in the render path.
+
 ## [0.1.2] - 2026-04-13
 
 ### Fixed
