@@ -195,7 +195,8 @@ fn handle_installed(app: &mut TuiApp, key: KeyEvent) -> Action {
                 if let Some(&(orig_idx, _)) = filtered.get(app.models_tab.selected) {
                     if let Some(model) = app.models_tab.models.get(orig_idx) {
                         let path = model.path.clone();
-                        let _ = catapult_lib::models::delete_model(&path);
+                        let prune = app.config.hf_cache_prune_on_delete;
+                        let _ = catapult_lib::models::delete_model(&path, prune);
                         app.models_tab.loaded = false;
                     }
                 }

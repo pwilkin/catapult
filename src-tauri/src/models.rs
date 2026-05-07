@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::AppConfig;
@@ -239,11 +241,38 @@ pub fn list_installed_models(config: &AppConfig) -> Result<Vec<ModelInfo>> {
         save_cache(&cache);
     }
 
+    // Scan the HuggingFace Hub cache for additional models.
+    scan_hf_cache(&mut models, &mut seen_paths, &mut cache, &mut cache_dirty);
+
+    if cache_dirty {
+        save_cache(&cache);
+    }
+
     // Consolidate split GGUF files into single entries
     models = consolidate_split_models(models);
 
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
+}
+
+/// Scan the HuggingFace Hub cache for GGUF files and add them to `models`.
+/// Uses `hf_hub::Cache::from_env()` which respects `HF_HOME` (defaults to
+/// `~/.cache/huggingface/`). The `Cache::path()` method returns `$HF_HOME/hub`
+/// (default ~/.cache/huggingface/hub), so no extra path segment is needed.
+fn scan_hf_cache(
+    models: &mut Vec<ModelInfo>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    gguf_cache: &mut GgufCache,
+    cache_dirty: &mut bool,
+) {
+    let hf_cache = hf_hub::Cache::from_env();
+    let hf_root = hf_cache.path();
+
+    if !hf_root.exists() {
+        return;
+    }
+
+    scan_gguf_recursive(hf_root, models, seen, gguf_cache, cache_dirty, 8);
 }
 
 /// Group split GGUF parts (e.g. model-00001-of-00003.gguf) into single ModelInfo entries.
@@ -444,8 +473,14 @@ fn find_mmproj(model_path: &Path, model_filename: &str, cache: &GgufCache) -> Op
             .filter(|seg| fname_lower.contains(*seg))
             .count();
 
-        // Require at least 2 matching segments (name + params typically)
-        if matches >= 2 {
+        // Require at least 2 matching segments (name + params typically).
+        // Exception: if both files are symlinks inside an HF cache snapshot
+        // directory, they share the same commit — treat any mmproj as a valid
+        // companion since HF stores all repo files in one snapshots/{commit}/ dir.
+        let is_hf_snapshot = std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if matches >= 2 || (is_hf_snapshot && fname_lower.contains("mmproj")) {
             if best.as_ref().map_or(true, |(_, best_m)| matches > *best_m) {
                 best = Some((path, matches));
             }
@@ -538,11 +573,15 @@ pub fn get_recommended_models(config: &AppConfig) -> Result<Vec<RecommendedModel
 
 pub async fn download_model(
     client: &reqwest::Client,
-    _repo_id: &str,
+    repo_id: &str,
     file: &HfFile,
     config: &AppConfig,
-    progress_cb: impl Fn(DownloadProgress) + Send + Sync,
+    progress_cb: impl Fn(DownloadProgress) + Send + Sync + 'static,
 ) -> Result<PathBuf> {
+    if config.hf_cache_enabled {
+        return download_hf_cache(client, repo_id, file, progress_cb).await;
+    }
+
     let models_dir = config.models_dir()?;
     std::fs::create_dir_all(&models_dir)?;
 
@@ -570,6 +609,128 @@ pub fn prefixed_mmproj_filename(model_filename: &str, mmproj_filename: &str) -> 
     }
 
     format!("{}-{}", base, mmproj_filename)
+}
+
+/// Download a model file into the HuggingFace Hub cache using hf_hub.
+async fn download_hf_cache(
+    _client: &reqwest::Client,
+    repo_id: &str,
+    file: &HfFile,
+    progress_cb: impl Fn(DownloadProgress) + Send + Sync + 'static,
+) -> Result<PathBuf> {
+    let filename = &file.filename;
+
+    // Wrap the callback in an Arc so it can be shared across hf_hub's Progress impl.
+    let progress_shared = Arc::new(progress_cb);
+    let hf_progress = HfProgressBridge {
+        id: filename.to_string(),
+        current: Arc::new(AtomicU64::new(0)),
+        total_bytes: Arc::new(AtomicU64::new(0)),
+        callback: progress_shared.clone(),
+    };
+
+    // Build the HF Hub API with a custom user agent.
+    let api = hf_hub::api::tokio::ApiBuilder::from_env()
+        .with_user_agent("catapult-launcher/0.1", "0.1")
+        .build()?;
+    let repo = api.model(repo_id.to_string());
+
+    // ── Check if the file is already fully cached before downloading ──────
+    // hf_hub's Cache::get() follows refs/main → commit_hash → snapshot symlink.
+    // If it resolves and the blob exists, skip the download entirely.
+    let cache = hf_hub::Cache::from_env();
+    let hf_repo = cache.repo(hf_hub::Repo::model(repo_id.to_string()));
+    if let Some(cached_path) = hf_repo.get(filename) {
+        if cached_path.exists() {
+            log::info!("Model {} already in HF cache, skipping download", filename);
+            let size = std::fs::metadata(&cached_path).map(|m| m.len()).unwrap_or(0);
+            progress_shared(DownloadProgress {
+                id: filename.to_string(),
+                bytes_downloaded: size,
+                total_bytes: size,
+                percent: 100.0,
+                status: "done".to_string(),
+            });
+            return Ok(cached_path);
+        }
+    }
+
+    // Download with progress tracking — writes directly into the HF cache.
+    // The authoritative total size comes from hf_hub's metadata (init()),
+    // not from file.size_bytes which may be stale or missing.
+    let pointer_path = repo.download_with_progress(filename, hf_progress).await?;
+
+    // Clean up any stale .lock file left behind by hf_hub. The hf_hub crate
+    // creates a {blob}.lock file for flock-based concurrency control but
+    // never deletes it (Handle::drop only calls unlock()). After a successful
+    // download the lock is no longer held, so we can remove the sentinel.
+    let blob_path = hf_repo.blob_path(
+        &api.metadata(&repo.url(filename)).await?.etag()
+    );
+    let mut lock_path = blob_path.clone();
+    lock_path.set_extension("lock");
+    if lock_path.exists() {
+        log::debug!("Removing stale .lock file: {:?}", lock_path);
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    Ok(pointer_path)
+}
+
+/// Bridges hf_hub's async Progress trait to our DownloadProgress callback.
+/// Uses two AtomicU64s so that all cloned instances (used for parallel chunk
+/// downloads) share both the byte count and the authoritative total size
+/// reported by hf_hub's metadata — otherwise progress percentages would be
+/// wrong if file.size_bytes differs from the actual download size.
+#[derive(Clone)]
+pub struct HfProgressBridge {
+    id: String,
+    current: Arc<AtomicU64>,
+    total_bytes: Arc<AtomicU64>,
+    callback: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+}
+
+impl hf_hub::api::tokio::Progress for HfProgressBridge {
+    async fn init(&mut self, size: usize, _filename: &str) {
+        let total = size as u64;
+        self.total_bytes.store(total, Ordering::SeqCst);
+        self.current.store(0, Ordering::SeqCst);
+        (self.callback)(DownloadProgress {
+            id: self.id.clone(),
+            bytes_downloaded: 0,
+            total_bytes: total,
+            percent: 0.0,
+            status: "downloading".to_string(),
+        });
+    }
+
+    async fn update(&mut self, size: usize) {
+        let current = self.current.fetch_add(size as u64, Ordering::SeqCst) + size as u64;
+        let total = self.total_bytes.load(Ordering::SeqCst);
+        let percent = if total > 0 {
+            ((current as f64 / total as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        (self.callback)(DownloadProgress {
+            id: self.id.clone(),
+            bytes_downloaded: current,
+            total_bytes: total,
+            percent,
+            status: "downloading".to_string(),
+        });
+    }
+
+    async fn finish(&mut self) {
+        let total = self.total_bytes.load(Ordering::SeqCst);
+        (self.callback)(DownloadProgress {
+            id: self.id.clone(),
+            bytes_downloaded: total,
+            total_bytes: total,
+            percent: 100.0,
+            status: "done".to_string(),
+        });
+    }
 }
 
 /// Download all parts of a split GGUF model, reporting combined progress.
@@ -839,8 +1000,24 @@ pub fn abort_download(filename: &str, config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_model(path: &Path) -> Result<()> {
+pub fn delete_model(path: &Path, prune_hf_cache: bool) -> Result<()> {
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Before deleting, try to extract the HF cache repo directory so we can
+    // prune orphaned blobs after removal (the symlink itself will be gone).
+    let hf_repo_dir = if prune_hf_cache {
+        extract_hf_cache_repo(path)
+    } else {
+        None
+    };
+
+    // For HF cache models, also remove all symlinks in the same snapshot
+    // commit directory (model weights + mmproj companions).
+    let snapshot_dir = if prune_hf_cache {
+        extract_snapshot_dir(path)
+    } else {
+        None
+    };
 
     if let Some((base, _, total)) = huggingface::parse_split_filename(filename) {
         // Delete all parts of the split model
@@ -857,7 +1034,157 @@ pub fn delete_model(path: &Path) -> Result<()> {
         std::fs::remove_file(path)?;
     }
 
+    // Remove all symlinks in the same snapshot commit directory (model weights
+    // + mmproj companions). The pruning step below will clean up orphaned blobs.
+    if let Some(snapshot_dir) = &snapshot_dir {
+        if let Ok(entries) = std::fs::read_dir(snapshot_dir) {
+            for entry in entries.flatten() {
+                let link_path = entry.path();
+                if link_path.is_symlink() {
+                    log::debug!("Removing snapshot symlink: {:?}", link_path);
+                    let _ = std::fs::remove_file(&link_path);
+                }
+            }
+        }
+    }
+
+    // Prune orphaned blobs from the HF cache if requested.
+    if let Some(repo_dir) = hf_repo_dir {
+        prune_hf_cache_blobs(&repo_dir);
+    }
+
     Ok(())
+}
+
+/// Try to detect whether `path` is inside an HF Hub cache and return the
+/// repo directory (e.g. `~/.cache/huggingface/hub/models--org--repo`).
+fn extract_hf_cache_repo(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    // Blob path: .../blobs/{etag}
+    // Snapshot symlink: .../snapshots/{commit}/{filename} → ../../blobs/{etag}
+    // We look for a `blobs` or `snapshots` ancestor to find the repo dir.
+    for component in canonical.components() {
+        if let std::path::Component::Normal(name) = component {
+            if name.to_string_lossy() == "blobs" || name.to_string_lossy() == "snapshots" {
+                // Parent of blobs/ or snapshots/ is the repo directory.
+                return canonical.parent()?.parent().map(PathBuf::from);
+            }
+        }
+    }
+    None
+}
+
+/// Try to detect whether `path` is inside an HF Hub cache snapshot and
+/// return the commit directory (e.g. `.../snapshots/{commit_hash}`).
+fn extract_snapshot_dir(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    for component in canonical.components() {
+        if let std::path::Component::Normal(name) = component {
+            if name.to_string_lossy() == "snapshots" {
+                // Parent of snapshots/ is the repo dir; its child is the commit dir.
+                return canonical.parent()?.parent().map(PathBuf::from);
+            }
+        }
+    }
+    None
+}
+
+
+
+/// Prune orphaned blob files from the HuggingFace Hub cache for the given
+/// `repo_dir`. Walks all remaining snapshots and removes any blob that is
+/// no longer referenced by at least one snapshot.
+fn prune_hf_cache_blobs(repo_dir: &Path) {
+    // repo_dir is the HF cache repo directory (e.g. models--org--repo).
+    let snapshots_dir = repo_dir.join("snapshots");
+    if !snapshots_dir.exists() {
+        return; // No snapshots — nothing to check
+    }
+
+    // Collect all blob names referenced by snapshot symlinks.
+    let mut referenced = std::collections::HashSet::new();
+    if let Ok(commit_dirs) = std::fs::read_dir(&snapshots_dir) {
+        for commit_entry in commit_dirs.flatten() {
+            let commit_dir = commit_entry.path();
+            if !commit_dir.is_dir() {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&commit_dir) {
+                for file_entry in files.flatten() {
+                    let link_path = file_entry.path();
+                    if !link_path.is_symlink() {
+                        continue;
+                    }
+                    // Read the symlink target and extract the blob name.
+                    if let Ok(target) = std::fs::read_link(&link_path) {
+                        if let Some(blob_name) = target.file_name().and_then(|n| n.to_str()) {
+                            referenced.insert(blob_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete blobs not referenced by any snapshot.
+    let blobs_dir = repo_dir.join("blobs");
+    if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            // Skip .lock files — they're not blobs.
+            if name_str.ends_with(".lock") {
+                continue;
+            }
+            if !referenced.contains(&name_str) {
+                log::debug!("Pruning orphaned HF cache blob: {:?}", entry.path());
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    // Clean up empty snapshot commit directories.
+    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.is_dir() && is_dir_empty(&dir) {
+                log::debug!("Removing empty snapshot commit dir: {:?}", dir);
+                let _ = std::fs::remove_dir(&dir);
+            }
+        }
+    }
+
+    // Clean up the snapshots/ directory itself if empty.
+    if is_dir_empty(&snapshots_dir) {
+        log::debug!("Removing empty snapshots dir: {:?}", snapshots_dir);
+        let _ = std::fs::remove_dir(&snapshots_dir);
+    }
+
+    // Clean up the refs/ directory if empty.
+    let refs_dir = repo_dir.join("refs");
+    if is_dir_empty(&refs_dir) {
+        log::debug!("Removing empty refs dir: {:?}", refs_dir);
+        let _ = std::fs::remove_dir(&refs_dir);
+    }
+
+    // Clean up the blobs/ directory if empty.
+    if is_dir_empty(&blobs_dir) {
+        log::debug!("Removing empty blobs dir: {:?}", blobs_dir);
+        let _ = std::fs::remove_dir(&blobs_dir);
+    }
+
+    // If the entire repo directory is now empty, remove it.
+    if is_dir_empty(repo_dir) {
+        log::debug!("Removing empty HF cache repo dir: {:?}", repo_dir);
+        let _ = std::fs::remove_dir(repo_dir);
+    }
+}
+
+/// Returns true if the directory contains no files or subdirectories.
+fn is_dir_empty(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true)
 }
 
 fn sanitize_id(filename: &str) -> String {

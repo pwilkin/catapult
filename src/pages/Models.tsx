@@ -24,6 +24,7 @@ import type {
   HfFile,
   KnownOwner,
   DownloadProgress,
+  AppConfig,
 } from "../types";
 
 type Tab = "installed" | "recommended" | "browse" | "settings";
@@ -61,6 +62,8 @@ export default function Models() {
   const [quantFilter, setQuantFilter] = useState("");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [preferredOwners, setPreferredOwners] = useState<string[]>([]);
+  const [hfCacheEnabled, setHfCacheEnabled] = useState(false);
+  const [hfCachePruneOnDelete, setHfCachePruneOnDelete] = useState(false);
   const [mmProjPicker, setMmProjPicker] = useState<{
     repoId: string;
     file: HfFile;
@@ -104,6 +107,12 @@ export default function Models() {
     reloadFavorites();
     invoke<KnownOwner[]>("get_known_owners").then(setOwners).catch(() => {});
     invoke<string[]>("get_preferred_owners").then(setPreferredOwners).catch(() => {});
+    invoke<AppConfig>("get_config")
+      .then((cfg) => {
+        setHfCacheEnabled(cfg.hf_cache_enabled);
+        setHfCachePruneOnDelete(cfg.hf_cache_prune_on_delete);
+      })
+      .catch(() => {});
 
     const unlisten = listen<DownloadProgress>("download_progress", (e) => {
       const p = e.payload;
@@ -214,6 +223,11 @@ export default function Models() {
     }
   };
 
+  // Detect if a model path is inside the HuggingFace cache.
+  // Windows uses backslashes, Unix uses forward slashes — check both.
+  const isHfCacheModel = (path: string) =>
+    path.includes(".cache/huggingface") || path.includes(".cache\\huggingface");
+
   const deleteModel = async (m: ModelInfo) => {
     setDeletingId(m.id);
     try {
@@ -266,6 +280,24 @@ export default function Models() {
       await invoke("set_preferred_owners", { owners: newOwners });
       const updated = await invoke<KnownOwner[]>("get_known_owners");
       setOwners(updated);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const toggleHfCache = async (enabled: boolean) => {
+    setHfCacheEnabled(enabled);
+    try {
+      await invoke("set_hf_cache_enabled", { enabled });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const toggleHfCachePrune = async (enabled: boolean) => {
+    setHfCachePruneOnDelete(enabled);
+    try {
+      await invoke("set_hf_cache_prune_on_delete", { enabled });
     } catch (e) {
       setError(String(e));
     }
@@ -457,7 +489,12 @@ export default function Models() {
                         </button>
                         <div className="flex-1 min-w-0">
                           <p className="text-sm text-gray-200 truncate">{m.name}</p>
-                          <p className="text-[10px] text-gray-600 truncate font-mono">{m.filename}</p>
+                          <p className="text-[10px] text-gray-600 truncate font-mono flex items-center gap-1.5">
+                            {m.filename}
+                            {isHfCacheModel(m.path) && (
+                              <span className="badge-purple text-[9px] shrink-0">HF</span>
+                            )}
+                          </p>
                         </div>
                         <span className="w-16 text-right text-xs text-gray-400">
                           {m.params_b ?? "—"}
@@ -528,17 +565,48 @@ export default function Models() {
                       {!m.installed && !isDownloading && (
                         <button
                           className="btn-primary text-xs"
-                          onClick={() =>
-                            startDownload(m.repo_id, {
-                              filename: m.filename,
-                              size_bytes: m.estimated_size_mb * 1024 * 1024,
-                              quant: m.quant,
-                              download_url: `https://huggingface.co/${m.repo_id}/resolve/main/${m.filename}`,
-                              is_split: false,
-                              split_parts: [],
-                              is_mmproj: false,
-                            })
-                          }
+                          onClick={async () => {
+                            // Fetch repo files if we don't have them yet.
+                            let files = repoFiles[m.repo_id];
+                            if (!files) {
+                              try {
+                                files = await invoke<HfFile[]>("get_hf_repo_files", { repoId: m.repo_id });
+                                setRepoFiles((prev) => ({ ...prev, [m.repo_id]: files }));
+                              } catch (e) {
+                                setError(String(e));
+                                return;
+                              }
+                            }
+                            const mmProjFiles = files.filter((f) => f.is_mmproj);
+                            // Use the actual file size from the HF API instead of our estimate.
+                            const hfFile = files.find((f) => !f.is_mmproj && f.filename === m.filename);
+                            const modelSize = hfFile?.size_bytes ?? (m.estimated_size_mb * 1024 * 1024);
+                            if (mmProjFiles.length > 0) {
+                              setMmProjPicker({
+                                repoId: m.repo_id,
+                                file: {
+                                  filename: m.filename,
+                                  size_bytes: modelSize,
+                                  quant: m.quant,
+                                  download_url: `https://huggingface.co/${m.repo_id}/resolve/main/${m.filename}`,
+                                  is_split: false,
+                                  split_parts: [],
+                                  is_mmproj: false,
+                                },
+                                mmProjFiles,
+                              });
+                            } else {
+                              startDownload(m.repo_id, {
+                                filename: m.filename,
+                                size_bytes: modelSize,
+                                quant: m.quant,
+                                download_url: `https://huggingface.co/${m.repo_id}/resolve/main/${m.filename}`,
+                                is_split: false,
+                                split_parts: [],
+                                is_mmproj: false,
+                              });
+                            }
+                          }}
                         >
                           <Download size={12} />
                           Download
@@ -771,7 +839,7 @@ export default function Models() {
         {tab === "settings" && (
           <div className="space-y-6">
             {/* Download directory */}
-            <div className="card">
+            <div className={`card ${hfCacheEnabled ? "opacity-50 pointer-events-none" : ""}`}>
               <h2 className="section-title">Download Directory</h2>
               <p className="text-xs text-gray-500 mb-3">
                 New models are downloaded to this directory.
@@ -780,10 +848,40 @@ export default function Models() {
                 <span className="flex-1 text-sm font-mono text-gray-300 truncate">
                   {downloadDir}
                 </span>
-                <button className="btn-ghost text-xs" onClick={browseNewDownloadDir}>
+                <button className="btn-ghost text-xs" onClick={browseNewDownloadDir} disabled={hfCacheEnabled}>
                   <FolderOpen size={12} /> Change
                 </button>
               </div>
+            </div>
+
+            {/* HuggingFace cache */}
+            <div className="card">
+              <h2 className="section-title">HuggingFace Hub Cache</h2>
+              <p className="text-xs text-gray-500 mb-3">
+                When enabled, downloads are written to your HuggingFace cache
+                (<code>HF_HOME</code> or <code>~/.cache/huggingface/</code>) instead of the download directory.
+                Models from the cache are auto-discovered and shown with an "HF" badge.
+              </p>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={hfCacheEnabled}
+                  onChange={(e) => toggleHfCache(e.target.checked)}
+                  className="w-4 h-4 accent-primary rounded"
+                />
+                <span className="text-sm text-gray-300">Enable HF cache downloads</span>
+              </label>
+              {hfCacheEnabled && (
+                <label className="flex items-center gap-2 cursor-pointer mt-3">
+                  <input
+                    type="checkbox"
+                    checked={hfCachePruneOnDelete}
+                    onChange={(e) => toggleHfCachePrune(e.target.checked)}
+                    className="w-4 h-4 accent-primary rounded"
+                  />
+                  <span className="text-sm text-gray-300">Prune orphaned blobs after delete</span>
+                </label>
+              )}
             </div>
 
             {/* Scan directories */}
