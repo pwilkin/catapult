@@ -216,4 +216,6 @@ export interface AppConfig {
   /** Maps model file path → last-used preset name */
   model_presets: Record<string, string>;
   preferred_owners: string[];
+  hf_cache_enabled: boolean;
+  hf_cache_prune_on_delete: boolean;
 }

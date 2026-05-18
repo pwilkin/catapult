@@ -85,6 +85,18 @@ pub struct AppConfig {
     /// Preferred GGUF source owners on HuggingFace, in priority order.
     #[serde(default)]
     pub preferred_owners: Vec<String>,
+    /// When enabled, model downloads are written to the HuggingFace Hub cache
+    /// (HF_HOME or ~/.cache/huggingface/) instead of the configured download_dir.
+    #[serde(default)]
+    pub hf_cache_enabled: bool,
+    /// When enabled, deletes remove orphaned blobs from the HF cache after
+    /// removing the snapshot symlink. Defaults to true.
+    #[serde(default = "default_hf_cache_prune_on_delete")]
+    pub hf_cache_prune_on_delete: bool,
+}
+
+fn default_hf_cache_prune_on_delete() -> bool {
+    true
 }
 
 impl AppConfig {

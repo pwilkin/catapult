@@ -299,6 +299,20 @@ async fn set_preferred_owners(
 }
 
 #[tauri::command]
+async fn set_hf_cache_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.hf_cache_enabled = enabled;
+    config.save().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_hf_cache_prune_on_delete(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.hf_cache_prune_on_delete = enabled;
+    config.save().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn validate_hf_owner(
     owner: String,
     state: State<'_, AppState>,
@@ -347,9 +361,11 @@ async fn download_model(
         _ => (false, vec![]),
     };
 
-    // If downloading an mmproj alongside a model, prefix the filename
+    // If downloading an mmproj alongside a model, prefix the filename.
+    // When HF cache is enabled, skip prefixing — hf_hub stores files by
+    // their original repo path, so we pass the un-prefixed name through.
     let is_mmproj = huggingface::is_mmproj_file(&filename);
-    let save_filename = if is_mmproj {
+    let save_filename = if is_mmproj && !config.hf_cache_enabled {
         if let Some(ref model_name) = companion_model {
             models::prefixed_mmproj_filename(model_name, &filename)
         } else {
@@ -408,8 +424,9 @@ async fn download_model(
 }
 
 #[tauri::command]
-async fn delete_model(path: String, _state: State<'_, AppState>) -> Result<(), String> {
-    models::delete_model(&std::path::PathBuf::from(path)).map_err(|e| e.to_string())
+async fn delete_model(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let prune = state.config.lock().unwrap().hf_cache_prune_on_delete;
+    models::delete_model(&std::path::PathBuf::from(path), prune).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -744,6 +761,8 @@ pub fn run() {
             get_known_owners,
             get_preferred_owners,
             set_preferred_owners,
+            set_hf_cache_enabled,
+            set_hf_cache_prune_on_delete,
             validate_hf_owner,
             search_hf_models,
             get_hf_repo_files,
