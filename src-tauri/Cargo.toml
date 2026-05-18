@@ -1,6 +1,6 @@
 [package]
 name = "catapult"
-version = "0.1.4"
+version = "0.1.5"
 description = "A llama.cpp launcher"
 authors = ["Piotr Wilkin <ilintar@gmail.com>"]
 edition = "2024"

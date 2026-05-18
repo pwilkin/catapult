@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.5] - 2026-05-18
+
+### Fixed
+
+- **Added MTP support**: added support for MTP parameters
+
 ## [0.1.4] - 2026-05-05
 
 ### Fixed
