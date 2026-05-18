@@ -203,6 +203,8 @@ const RENAMED_EP_KEYS: Record<string, string> = {
   "draft-p-min": "spec-draft-p-min",
   "draft-p-split": "spec-draft-p-split",
   "hf-repo-draft": "spec-draft-hf",
+  "cache-type-k-draft": "spec-draft-type-k",
+  "cache-type-v-draft": "spec-draft-type-v",
 };
 
 export function migrateExtraParams(extra: Record<string, string>): Record<string, string> {
@@ -1106,8 +1108,10 @@ export default function Server() {
             <div className="grid grid-cols-2 gap-3 mt-2">
               <TextInput label="Draft Model" hint="Path to draft model for speculation" value={getEp("spec-draft-model")}
                 onChange={(v) => setEp("spec-draft-model", v)} />
-              <SelectInput label="Spec Type" hint="Used when no draft model is provided" value={getEp("spec-type") || ""}
-                options={[{ value: "", label: "None" }, { value: "ngram-cache", label: "N-gram Cache" }, { value: "ngram-simple", label: "N-gram Simple" },
+              <SelectInput label="Spec Type" hint="draft-* types use the draft model; ngram-* types do not" value={getEp("spec-type") || ""}
+                options={[{ value: "", label: "None" },
+                  { value: "draft-simple", label: "Draft Simple" }, { value: "draft-eagle3", label: "Draft EAGLE3" }, { value: "draft-mtp", label: "Draft MTP" },
+                  { value: "ngram-cache", label: "N-gram Cache" }, { value: "ngram-simple", label: "N-gram Simple" },
                   { value: "ngram-map-k", label: "N-gram Map K" }, { value: "ngram-map-k4v", label: "N-gram Map K4V" }, { value: "ngram-mod", label: "N-gram Mod" }]}
                 onChange={(v) => setEp("spec-type", v)} />
               <NumberInput label="Draft Max" hint="Max draft tokens (default: 16)" value={getEpNum("spec-draft-n-max")} min={1}
@@ -1128,6 +1132,12 @@ export default function Server() {
                 onChange={(v) => setEpNum("spec-draft-threads-batch", v)} />
               <TextInput label="Draft Device" hint="Devices for draft model, comma-separated" value={getEp("spec-draft-device")}
                 onChange={(v) => setEp("spec-draft-device", v)} />
+              <SelectInput label="Draft KV Cache Type (K)" hint="KV cache K data type for draft model" value={getEp("spec-draft-type-k") || "f16"}
+                options={KV_TYPES.map((t) => ({ value: t, label: t }))}
+                onChange={(v) => setEp("spec-draft-type-k", v === "f16" ? "" : v)} />
+              <SelectInput label="Draft KV Cache Type (V)" hint="KV cache V data type for draft model" value={getEp("spec-draft-type-v") || "f16"}
+                options={KV_TYPES.map((t) => ({ value: t, label: t }))}
+                onChange={(v) => setEp("spec-draft-type-v", v === "f16" ? "" : v)} />
             </div>
             {/* Per-spec-type ngram controls — shown only for the selected type */}
             {getEp("spec-type") === "ngram-mod" && (

@@ -178,6 +178,8 @@ pub fn migrate_extra_params(extra: &mut HashMap<String, String>) -> bool {
         ("draft-p-min", "spec-draft-p-min"),
         ("draft-p-split", "spec-draft-p-split"),
         ("hf-repo-draft", "spec-draft-hf"),
+        ("cache-type-k-draft", "spec-draft-type-k"),
+        ("cache-type-v-draft", "spec-draft-type-v"),
     ];
 
     let mut changed = false;
