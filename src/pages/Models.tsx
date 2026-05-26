@@ -60,6 +60,7 @@ export default function Models() {
   const [nameFilter, setNameFilter] = useState("");
   const [quantFilter, setQuantFilter] = useState("");
   const [favorites, setFavorites] = useState<string[]>([]);
+  const [selectedModelPath, setSelectedModelPath] = useState<string | null>(null);
   const [preferredOwners, setPreferredOwners] = useState<string[]>([]);
   const [mmProjPicker, setMmProjPicker] = useState<{
     repoId: string;
@@ -98,10 +99,25 @@ export default function Models() {
     } catch {}
   };
 
+  const reloadSelectedModel = useCallback(async () => {
+    try {
+      const cfg = await invoke<{ selected_model: string | null }>("get_config");
+      setSelectedModelPath(cfg.selected_model);
+    } catch {}
+  }, []);
+
+  const selectForServer = async (modelPath: string) => {
+    try {
+      await invoke("set_selected_model", { modelPath });
+      await reloadSelectedModel();
+    } catch {}
+  };
+
   useEffect(() => {
     reload();
     reloadDirs();
     reloadFavorites();
+    reloadSelectedModel();
     invoke<KnownOwner[]>("get_known_owners").then(setOwners).catch(() => {});
     invoke<string[]>("get_preferred_owners").then(setPreferredOwners).catch(() => {});
 
@@ -447,6 +463,7 @@ export default function Models() {
                   <div>
                     {sorted.map((m) => {
                       const isFav = favorites.includes(m.id);
+                      const isSelected = selectedModelPath === m.path;
                       return (
                       <div key={m.id}
                         className="flex items-center gap-2 px-3 py-2 border-b border-border/50 hover:bg-surface-3 transition-colors">
@@ -471,6 +488,11 @@ export default function Models() {
                         <span className="w-20 text-right text-xs text-gray-400 font-mono">
                           {formatSize(m.size_bytes)}
                         </span>
+                        <button className="w-8 flex justify-center"
+                          onClick={() => selectForServer(m.path)}
+                          title={isSelected ? "Selected for server" : "Use for server"}>
+                          <CheckCircle size={13} className={isSelected ? "text-primary" : "text-gray-600 hover:text-gray-400"} />
+                        </button>
                         <button className="w-8 flex justify-center text-gray-600 hover:text-accent-red"
                           onClick={() => deleteModel(m)} disabled={deletingId === m.id} title="Delete model">
                           <Trash2 size={13} />
