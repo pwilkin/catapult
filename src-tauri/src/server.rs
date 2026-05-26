@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+#[cfg(target_os = "windows")]
+#[allow(unused_imports)]
+use std::os::windows::process::CommandExt;
+
+use crate::config::AppConfig;
 use crate::hardware::{suggest_config, SystemInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +102,12 @@ pub struct ServerState {
     pub process: Option<Child>,
     pub status: ServerStatus,
     pub log_lines: Vec<String>,
+    /// Whether this server was started by this app
+    pub started_by_us: bool,
+    /// For external servers: the PID we detected
+    pub external_pid: Option<u32>,
+    /// Whether we're in the process of stopping (to prevent immediate re-detection)
+    pub stopping: bool,
 }
 
 impl ServerState {
@@ -105,6 +116,9 @@ impl ServerState {
             process: None,
             status: ServerStatus::Stopped,
             log_lines: Vec::new(),
+            started_by_us: false,
+            external_pid: None,
+            stopping: false,
         }
     }
 
@@ -198,18 +212,24 @@ pub fn migrate_extra_params(extra: &mut HashMap<String, String>) -> bool {
     changed
 }
 
+/// Helper function to get log file path
+fn log_file_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("catapult").join("server.log"))
+}
+
 pub async fn start_server(
     server_binary: &PathBuf,
     config: &ServerConfig,
     state: SharedServerState,
     log_cb: impl Fn(String) + Send + Sync + 'static,
 ) -> Result<()> {
-    // Check not already running
+    // Check not already running, and clear stopping flag
     {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
         if s.is_running() {
             anyhow::bail!("Server is already running");
         }
+        s.stopping = false; // 允许重新启动，清除停止标志
     }
 
     let args = build_args(config);
@@ -217,14 +237,26 @@ pub async fn start_server(
     let cmdline = format!("{} {}", server_binary.display(), args.join(" "));
     log::info!("Starting llama-server: {}", cmdline);
 
+    // Open log file for writing (append mode)
+    let log_file = if let Some(log_path) = log_file_path() {
+        // Ensure parent directory exists
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Write command header
+        let _ = std::fs::write(&log_path, format!("# {}\n", cmdline));
+        // Open in append mode
+        std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok()
+    } else {
+        None
+    };
+
     let mut cmd = Command::new(server_binary);
     cmd.args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let mut child = cmd.spawn()
@@ -232,6 +264,11 @@ pub async fn start_server(
 
     let pid = child.id().unwrap_or(0);
     let port = config.port;
+
+    // Write PID file like TUI does
+    if let Some(pid_path) = pid_file_path() {
+        let _ = std::fs::write(&pid_path, format!("{}\n{}", pid, server_binary.display()));
+    }
 
     // Take stdout/stderr before storing child in state
     let stdout = child.stdout.take().expect("stdout not piped");
@@ -242,6 +279,8 @@ pub async fn start_server(
         s.process = Some(child);
         s.status = ServerStatus::Starting;
         s.log_lines.clear();
+        s.started_by_us = true;
+        s.external_pid = None;
         // Add commandline as first log entry (after clear)
         s.log_lines.push(format!("$ {}", cmdline));
     }
@@ -255,6 +294,10 @@ pub async fn start_server(
     let log_cb_clone = log_cb.clone();
     let log_cb_exit = log_cb.clone();
 
+    // Share the log file across both tasks
+    let log_file_arc = Arc::new(Mutex::new(log_file));
+
+    let log_file_for_stdout = log_file_arc.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut buf = Vec::new();
@@ -278,6 +321,16 @@ pub async fn start_server(
                         log::info!("Server ready on port {}", port);
                     }
                     drop(s);
+
+                    // Write to log file
+                    if let Ok(mut f) = log_file_for_stdout.lock() {
+                        if let Some(ref mut file) = *f {
+                            use std::io::Write;
+                            let _ = writeln!(file, "{}", line);
+                            let _ = file.flush();
+                        }
+                    }
+
                     log_cb(line);
                 }
                 Err(e) => {
@@ -289,6 +342,7 @@ pub async fn start_server(
     });
 
     let state_clone2 = state.clone();
+    let log_file_for_stderr = log_file_arc.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut buf = Vec::new();
@@ -298,8 +352,9 @@ pub async fn start_server(
                 Ok(0) => break, // EOF
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                    let stderr_line = format!("[stderr] {}", line);
                     let mut s = state_clone2.lock().unwrap();
-                    s.log_lines.push(format!("[stderr] {}", line));
+                    s.log_lines.push(stderr_line.clone());
                     if s.log_lines.len() > 500 {
                         s.log_lines.drain(0..100);
                     }
@@ -310,7 +365,17 @@ pub async fn start_server(
                         s.status = ServerStatus::Running { port, pid };
                     }
                     drop(s);
-                    log_cb_clone(format!("[stderr] {}", line));
+
+                    // Write to log file
+                    if let Ok(mut f) = log_file_for_stderr.lock() {
+                        if let Some(ref mut file) = *f {
+                            use std::io::Write;
+                            let _ = writeln!(file, "{}", stderr_line);
+                            let _ = file.flush();
+                        }
+                    }
+
+                    log_cb_clone(stderr_line);
                 }
                 Err(e) => {
                     log::warn!("Error reading server stderr: {}", e);
@@ -369,15 +434,74 @@ pub async fn start_server(
     Ok(())
 }
 
+/// Stop a server by PID (for external processes)
+fn stop_server_by_pid(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        // Send SIGTERM
+        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if ret != 0 {
+            anyhow::bail!("Failed to send SIGTERM to PID {}", pid);
+        }
+
+        // Wait up to 30 seconds
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !process_alive(pid) {
+                cleanup_pid_file();
+                return Ok(());
+            }
+        }
+
+        // Force kill
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cleanup_pid_file();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+            fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        }
+        // PROCESS_TERMINATE = 0x0001
+        let handle = unsafe { OpenProcess(0x0001, 0, pid) };
+        if handle.is_null() {
+            anyhow::bail!("Failed to open process {} for termination", pid);
+        }
+        unsafe {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cleanup_pid_file();
+        Ok(())
+    }
+}
+
+fn cleanup_pid_file() {
+    if let Some(path) = pid_file_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub async fn stop_server(state: &SharedServerState) -> Result<()> {
-    let mut child = {
+    let (mut child, maybe_external_pid) = {
         let mut s = state.lock().unwrap();
         s.status = ServerStatus::Stopped;
-        s.process.take()
+        s.started_by_us = false;
+        let external_pid = s.external_pid.take();
+        s.stopping = true; // 标记为正在停止，防止立即重新检测
+        (s.process.take(), external_pid)
     };
 
     if let Some(ref mut child) = child {
-        // Send SIGTERM for graceful shutdown on Unix
+        // Stop process we started
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             unsafe {
@@ -386,13 +510,11 @@ pub async fn stop_server(state: &SharedServerState) -> Result<()> {
             log::info!("Sent SIGTERM to server (pid {})", pid);
         }
 
-        // On Windows, start_kill sends TerminateProcess immediately
         #[cfg(not(unix))]
         {
             let _ = child.start_kill();
         }
 
-        // Wait up to 30 seconds for graceful shutdown
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             child.wait(),
@@ -406,22 +528,31 @@ pub async fn stop_server(state: &SharedServerState) -> Result<()> {
                 log::warn!("Error waiting for server exit: {}", e);
             }
             Err(_) => {
-                // Timed out — force kill
                 log::warn!("Server did not stop within 30 seconds, force killing");
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             }
         }
+        cleanup_pid_file();
+    } else if let Some(pid) = maybe_external_pid {
+        // Stop external process
+        log::info!("Stopping external server (pid {})", pid);
+        stop_server_by_pid(pid)?;
     }
 
     Ok(())
 }
 
 /// Synchronous kill for use during app exit — sends SIGTERM/TerminateProcess
-/// and waits briefly for the process to exit.
+/// and waits briefly for the process to exit, only if we started it.
 pub fn kill_server_sync(state: &SharedServerState) {
     let mut child = {
         let mut s = state.lock().unwrap();
+        if !s.started_by_us {
+            // Don't kill external servers on app exit
+            log::info!("Not killing server on exit (external or from TUI)");
+            return;
+        }
         s.status = ServerStatus::Stopped;
         s.process.take()
     };
@@ -584,6 +715,277 @@ pub fn build_args(config: &ServerConfig) -> Vec<String> {
     }
 
     args
+}
+
+// ── External Server Detection ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct DetectedServer {
+    pub pid: u32,
+    pub binary_path: PathBuf,
+    pub port: u16,
+    pub model_path: Option<String>,
+    pub runtime_label: Option<String>,
+    pub origin: ServerOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerOrigin {
+    Tui,
+    External,
+    ExternalUnknown,
+}
+
+fn pid_file_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("catapult").join("server.pid"))
+}
+
+/// Detects any running llama-server process (from any source) - returns detailed info
+pub fn detect_server(config: &AppConfig) -> Option<DetectedServer> {
+    if let Some(tui_server) = check_pid_file(config) {
+        return Some(tui_server);
+    }
+    scan_proc_for_servers(config)
+}
+
+/// Simple version for GUI: only returns pid and port
+pub fn detect_server_simple(config: &AppConfig) -> Option<(u32, u16)> {
+    detect_server(config).map(|s| (s.pid, s.port))
+}
+
+fn check_pid_file(config: &AppConfig) -> Option<DetectedServer> {
+    let pid_path = pid_file_path()?;
+    let content = std::fs::read_to_string(&pid_path).ok()?;
+    let mut lines = content.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let binary_path_str = lines.next().unwrap_or("");
+
+    if !process_alive(pid) {
+        let _ = std::fs::remove_file(&pid_path);
+        return None;
+    }
+
+    let binary_path = if binary_path_str.is_empty() {
+        std::fs::read_link(format!("/proc/{}/exe", pid)).unwrap_or_default()
+    } else {
+        PathBuf::from(binary_path_str)
+    };
+
+    let port = read_port_from_proc(pid).unwrap_or(8080);
+    let model_path = read_arg_from_proc(pid, "--model").or_else(|| read_arg_from_proc(pid, "-m"));
+    let runtime_label = match_runtime(&binary_path, config);
+
+    Some(DetectedServer {
+        pid,
+        binary_path,
+        port,
+        model_path,
+        runtime_label,
+        origin: ServerOrigin::Tui,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn scan_proc_for_servers(config: &AppConfig) -> Option<DetectedServer> {
+    use std::path::Path;
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+
+    for entry in proc_dir.flatten() {
+        let pid_str = entry.file_name();
+        let pid_str = pid_str.to_str()?;
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let cmdline = match std::fs::read(&cmdline_path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+
+        let args: Vec<&str> = cmdline
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+
+        if args.is_empty() {
+            continue;
+        }
+
+        let exe_name = Path::new(args[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if exe_name != "llama-server" && exe_name != "llama-server.exe" {
+            continue;
+        }
+
+        let binary_path = std::fs::read_link(format!("/proc/{}/exe", pid))
+            .unwrap_or_else(|_| PathBuf::from(args[0]));
+
+        let port = args
+            .windows(2)
+            .find(|w| w[0] == "--port" || w[0] == "-p")
+            .and_then(|w| w[1].parse().ok())
+            .unwrap_or(8080);
+
+        let model_path = args
+            .windows(2)
+            .find(|w| w[0] == "--model" || w[0] == "-m")
+            .map(|w| w[1].to_string());
+
+        let runtime_label = match_runtime(&binary_path, config);
+        let origin = if runtime_label.is_some() {
+            ServerOrigin::External
+        } else {
+            ServerOrigin::ExternalUnknown
+        };
+
+        return Some(DetectedServer {
+            pid,
+            binary_path,
+            port,
+            model_path,
+            runtime_label,
+            origin,
+        });
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_proc_for_servers(config: &AppConfig) -> Option<DetectedServer> {
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(
+            ProcessRefreshKind::new()
+                .with_cmd(UpdateKind::Always)
+                .with_exe(UpdateKind::Always),
+        ),
+    );
+
+    for (pid, process) in sys.processes() {
+        let name = process.name().to_string_lossy();
+        if name != "llama-server" && name != "llama-server.exe" {
+            continue;
+        }
+
+        let cmd = process.cmd();
+        let binary_path = process.exe().map(PathBuf::from).unwrap_or_default();
+
+        let port = cmd
+            .windows(2)
+            .find(|w| w[0] == "--port" || w[0] == "-p")
+            .and_then(|w| w[1].to_str()?.parse().ok())
+            .unwrap_or(8080);
+
+        let model_path = cmd
+            .windows(2)
+            .find(|w| w[0] == "--model" || w[0] == "-m")
+            .map(|w| w[1].to_string_lossy().into_owned());
+
+        let runtime_label = match_runtime(&binary_path, config);
+        let origin = if runtime_label.is_some() {
+            ServerOrigin::External
+        } else {
+            ServerOrigin::ExternalUnknown
+        };
+
+        return Some(DetectedServer {
+            pid: pid.as_u32(),
+            binary_path,
+            port,
+            model_path,
+            runtime_label,
+            origin,
+        });
+    }
+
+    None
+}
+
+fn match_runtime(binary_path: &PathBuf, config: &AppConfig) -> Option<String> {
+    let binary_str = binary_path.to_string_lossy();
+    for rt in &config.managed_runtimes {
+        if binary_str.contains(&rt.dir_name) {
+            return Some(format!("b{} {}", rt.build, rt.backend_label));
+        }
+    }
+    for rt in &config.custom_runtimes {
+        if binary_path == &rt.binary_path {
+            return Some(rt.label.clone());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_port_from_proc(pid: u32) -> Option<u16> {
+    read_arg_from_proc(pid, "--port")
+        .or_else(|| read_arg_from_proc(pid, "-p"))
+        .and_then(|s| s.parse().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_port_from_proc(pid: u32) -> Option<u16> {
+    read_arg_from_proc(pid, "--port")
+        .or_else(|| read_arg_from_proc(pid, "-p"))
+        .and_then(|s| s.parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_arg_from_proc(pid: u32, flag: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let args: Vec<&str> = cmdline
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok())
+        .collect();
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_arg_from_proc(pid: u32, flag: &str) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new().with_cmd(UpdateKind::Always)),
+    );
+    let process = sys.process(Pid::from(pid as usize))?;
+    process
+        .cmd()
+        .windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let handle = OpenProcess(0x1000, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        exit_code == 259
+    }
 }
 
 /// Build a suggested config based on system info and model size
