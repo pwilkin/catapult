@@ -529,12 +529,51 @@ async fn stop_server(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatus, String> {
-    Ok(state.server.lock().unwrap().status.clone())
+    let mut server_state = state.server.lock().unwrap();
+    let internal_status = server_state.status.clone();
+
+    // If internal status says running, use that
+    if matches!(internal_status, ServerStatus::Running { .. } | ServerStatus::Starting) {
+        return Ok(internal_status);
+    }
+
+    // If we're stopping, don't try to detect servers (like TUI's stopping flag)
+    if server_state.stopping {
+        return Ok(internal_status);
+    }
+
+    // Otherwise, try to detect external servers
+    let config = state.config.lock().unwrap().clone();
+    if let Some((pid, port)) = server::detect_server_simple(&config) {
+        server_state.external_pid = Some(pid);
+        server_state.started_by_us = false;
+        let status = ServerStatus::Running { port, pid };
+        server_state.status = status.clone();
+        return Ok(status);
+    }
+
+    Ok(internal_status)
 }
 
 #[tauri::command]
 async fn get_server_logs(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(state.server.lock().unwrap().log_lines.clone())
+}
+
+#[tauri::command]
+async fn get_server_logs_from_file() -> Result<Vec<String>, String> {
+    let log_path = dirs::data_dir()
+        .map(|d| d.join("catapult").join("server.log"))
+        .ok_or_else(|| "Could not determine data directory".to_string())?;
+    
+    if !log_path.exists() {
+        return Ok(vec![]);
+    }
+    
+    let content = std::fs::read_to_string(&log_path)
+        .map_err(|e| format!("Failed to read log file: {}", e))?;
+    
+    Ok(content.lines().map(|l| l.to_string()).collect())
 }
 
 #[tauri::command]
@@ -761,6 +800,7 @@ pub fn run() {
             stop_server,
             get_server_status,
             get_server_logs,
+            get_server_logs_from_file,
             suggest_server_config,
             open_chat_window,
             // Config
@@ -780,10 +820,7 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                let state = app.state::<AppState>();
-                server::kill_server_sync(&state.server);
-            }
+        .run(|_app, _event| {
+            // Don't auto-kill server on exit - let it keep running!
         });
 }

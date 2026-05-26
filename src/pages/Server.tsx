@@ -471,7 +471,7 @@ export default function Server() {
     // Only load defaults if no session-restored config
     if (!loadSessionConfig()) loadDefaults();
     // Load any existing logs (e.g. server started from Dashboard)
-    invoke<string[]>("get_server_logs").then((existing) => {
+    invoke<string[]>("get_server_logs_from_file").then((existing) => {
       if (existing.length > 0) {
         setLogs(existing);
         setShowLogs(true);
@@ -490,29 +490,12 @@ export default function Server() {
     };
   }, []);
 
-  const applyModelConfig = async (modelPath: string) => {
-    const model = models.find((m) => m.path === modelPath);
-    if (!model) return;
-    try {
-      const suggested = await invoke<ServerConfig>("suggest_server_config", {
-        modelPath, modelSizeMb: Math.round(model.size_bytes / (1024 * 1024)),
-      });
-      // Only apply hardware-dependent suggestions; preserve all user settings
-      setConfig((prev) => ({
-        ...prev,
-        n_ctx: suggested.n_ctx,
-        n_gpu_layers: suggested.n_gpu_layers,
-      }));
-    } catch {}
-  };
-
   const handleModelChange = async (m: ModelInfo) => {
     setConfig((c) => ({
       ...c,
       model_path: m.path,
       mmproj_path: m.is_vision && m.mmproj_path ? m.mmproj_path : null,
     }));
-    // Check if there's a saved preset for this model; if so, use it
     try {
       const savedPreset = await invoke<string | null>("get_model_preset", { modelPath: m.path });
       if (savedPreset) {
@@ -520,8 +503,6 @@ export default function Server() {
         return;
       }
     } catch {}
-    // No model-specific preset — apply hardware suggestions
-    await applyModelConfig(m.path);
   };
 
   const startServer = async () => {
@@ -538,7 +519,14 @@ export default function Server() {
   };
 
   const stopServer = async () => {
-    try { await invoke("stop_server"); }
+    try {
+      await invoke("stop_server");
+      setStatus({ type: "stopped" });
+      // Wait a bit and refresh to confirm stopped
+      setTimeout(async () => {
+        try { setStatus(await invoke<ServerStatus>("get_server_status")); } catch {}
+      }, 500);
+    }
     catch (e) { setError(String(e)); }
   };
 
