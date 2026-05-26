@@ -405,22 +405,8 @@ fn scan_gguf_recursive(
 /// the main model.
 fn find_mmproj(model_path: &Path, model_filename: &str, cache: &GgufCache) -> Option<PathBuf> {
     let dir = model_path.parent()?;
-    let stem = model_filename.trim_end_matches(".gguf");
-
-    // Extract the "model name + params" prefix, e.g. "Qwen3.5-4B" from "Qwen3.5-4B-Q4_K_M"
-    // Strip trailing quant pattern to get the base name
-    let re = regex::Regex::new(r"[-_](?:MXFP\d|IQ\d[_A-Z]*|Q\d[_KM0-9A-Z]+|F16|F32|BF16)$").unwrap();
-    let base = re.replace(stem, "").to_string();
-
-    // Split base into segments for matching
-    // e.g. "Qwen3.5-4B" → ["qwen3.5", "4b"]
-    let base_lower = base.to_lowercase();
-    let segments: Vec<&str> = base_lower.split(&['-', '_', '.'][..])
-        .filter(|s| !s.is_empty())
-        .collect();
 
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(PathBuf, usize)> = None;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -428,31 +414,18 @@ fn find_mmproj(model_path: &Path, model_filename: &str, cache: &GgufCache) -> Op
         let fname = path.file_name()?.to_string_lossy().to_string();
         let fname_lower = fname.to_lowercase();
         if !fname_lower.ends_with(".gguf") { continue; }
-        // Must not be the model itself
         if fname == model_filename { continue; }
 
-        // Check if this file is an mmproj: by filename OR by cached GGUF metadata
         let is_mmproj_by_name = fname_lower.contains("mmproj");
         let cache_key = path.to_string_lossy().to_string();
         let is_mmproj_by_cache = cache.get(&cache_key).map_or(false, |e| e.is_mmproj);
-        if !is_mmproj_by_name && !is_mmproj_by_cache {
-            continue;
-        }
 
-        // Count how many base segments appear in the mmproj filename
-        let matches = segments.iter()
-            .filter(|seg| fname_lower.contains(*seg))
-            .count();
-
-        // Require at least 2 matching segments (name + params typically)
-        if matches >= 2 {
-            if best.as_ref().map_or(true, |(_, best_m)| matches > *best_m) {
-                best = Some((path, matches));
-            }
+        if is_mmproj_by_name || is_mmproj_by_cache {
+            return Some(path);
         }
     }
 
-    best.map(|(p, _)| p)
+    None
 }
 
 struct CachedMeta {
