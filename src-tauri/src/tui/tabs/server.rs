@@ -215,6 +215,18 @@ fn collect_overrides(config: &ServerConfig) -> Vec<OverrideEntry> {
         });
     }
 
+    if let Some(mmproj) = &config.mmproj_path {
+        let name = std::path::Path::new(mmproj)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(mmproj);
+        overrides.push(OverrideEntry {
+            key: "mmproj_path".to_string(),
+            value: name.to_string(),
+            description: "Multimodal projector".to_string(),
+        });
+    }
+
     check_field!(n_gpu_layers, "n_gpu_layers", "GPU layers (-1=all)");
     check_field!(n_ctx, "n_ctx", "Context size (0=auto)");
     check_field!(flash_attn, "flash_attn", "Flash attention");
@@ -423,6 +435,7 @@ fn handle_value_edit_key(app: &mut TuiApp, key: KeyEvent) -> Action {
         KeyCode::Esc => {
             app.server_tab.focus = ServerFocus::Search;
             app.server_tab.editing_param = None;
+            app.input_focused = true;
         }
         KeyCode::Enter => {
             if let Some(ref param_key) = app.server_tab.editing_param.clone() {
@@ -432,6 +445,7 @@ fn handle_value_edit_key(app: &mut TuiApp, key: KeyEvent) -> Action {
                 app.server_tab.focus = ServerFocus::Search;
                 app.server_tab.editing_param = None;
                 app.server_tab.autocomplete.reset();
+                app.input_focused = true;
             }
         }
         KeyCode::Backspace => {
@@ -550,6 +564,14 @@ fn handle_preset_name(app: &mut TuiApp, key: KeyEvent) -> Action {
 
 fn apply_override(config: &mut ServerConfig, key: &str, value: &str) {
     match key {
+        "model_path" => config.model_path = value.to_string(),
+        "mmproj_path" => {
+            if value.is_empty() {
+                config.mmproj_path = None;
+            } else {
+                config.mmproj_path = Some(value.to_string());
+            }
+        }
         "n_gpu_layers" => {
             if let Ok(v) = value.parse() {
                 config.n_gpu_layers = v;
@@ -644,6 +666,7 @@ fn remove_override(config: &mut ServerConfig, key: &str) {
     let defaults = ServerConfig::default();
     match key {
         "model_path" => config.model_path = String::new(),
+        "mmproj_path" => config.mmproj_path = None,
         "n_gpu_layers" => config.n_gpu_layers = defaults.n_gpu_layers,
         "n_ctx" => config.n_ctx = defaults.n_ctx,
         "flash_attn" => config.flash_attn = defaults.flash_attn.clone(),
@@ -793,6 +816,13 @@ fn render_model_and_status(app: &TuiApp, area: Rect, frame: &mut Frame) {
             .unwrap_or(&app.server_tab.config.model_path)
     };
 
+    let mmproj_name = app.server_tab.config.mmproj_path.as_ref().map(|mmproj| {
+        std::path::Path::new(mmproj)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(mmproj)
+    });
+
     let server_status = match &app.server {
         Some(ds) => Span::styled(
             format!("  Running :{} (PID {})", ds.port, ds.pid),
@@ -801,16 +831,25 @@ fn render_model_and_status(app: &TuiApp, area: Rect, frame: &mut Frame) {
         None => Span::styled("  Stopped", Style::default().fg(Color::Red)),
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(" Model  ", Style::default().fg(Color::Blue)),
             Span::styled(model_name, Style::default().fg(Color::White)),
         ]),
-        Line::from(vec![
-            Span::styled(" Server ", Style::default().fg(Color::Blue)),
-            server_status,
-        ]),
     ];
+
+    if let Some(mmproj) = mmproj_name {
+        lines.push(Line::from(vec![
+            Span::styled(" MMproj ", Style::default().fg(Color::Blue)),
+            Span::styled(mmproj, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(" Server ", Style::default().fg(Color::Blue)),
+        server_status,
+    ]));
+
     frame.render_widget(Paragraph::new(lines), area);
 }
 

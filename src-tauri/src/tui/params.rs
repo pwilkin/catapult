@@ -23,6 +23,24 @@ pub struct ParamDef {
 pub static PARAMS: &[ParamDef] = &[
     // ── Context ──────────────────────────────────────────────────────────────
     ParamDef {
+        key: "model_path",
+        label: "Model Path",
+        description: "Path to model file (GGUF)",
+        param_type: ParamType::String,
+        default_display: "",
+        category: "Context",
+        is_typed_field: true,
+    },
+    ParamDef {
+        key: "mmproj_path",
+        label: "Multimodal Projector Path",
+        description: "Path to multimodal projector file (mmproj.gguf) for vision models",
+        param_type: ParamType::String,
+        default_display: "",
+        category: "Context",
+        is_typed_field: true,
+    },
+    ParamDef {
         key: "n_ctx",
         label: "Context Size",
         description: "Maximum context window size (0=auto from model)",
