@@ -1,5 +1,11 @@
 # Catapult
 
+# NOTICE:
+
+Since llama.cpp has moved to HuggingFace integration and already has a `llama` app for most launcher activities, I consider this project mostly obsoleted.
+
+If you want a launcher that can handle llama.cpp, but also other modalities with flexible, [GGML](https://github.com/ggml-org/ggml)-based engines that allow inference on most CUDA/ROCm/Vulkan devices, I strongly suggest [Lemonade](https://github.com/lemonade-sdk/lemonade).
+
 A desktop launcher for [llama.cpp](https://github.com/ggml-org/llama.cpp). Manages runtime versions, discovers and downloads models, configures the server with full parameter coverage, and provides an embedded chat interface — all without touching the command line.
 
 Available in two interfaces:
